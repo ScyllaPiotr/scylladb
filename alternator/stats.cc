@@ -96,8 +96,8 @@ static void register_metrics_with_optional_table(seastar::metrics::metric_groups
             OPERATION(update_time_to_live, "UpdateTimeToLive")
             OPERATION(list_streams, "ListStreams")
             OPERATION(describe_stream, "DescribeStream")
-            OPERATION(get_shard_iterator, "GetShardIterator")
-            OPERATION(get_records, "GetRecords")
+            OPERATION(get_stream_shard_iterator, "GetShardIterator")
+            OPERATION(get_stream_records, "GetRecords")
     });
     OPERATION_LATENCY(put_item_latency, "PutItem")
     OPERATION_LATENCY(get_item_latency, "GetItem")

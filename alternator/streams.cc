@@ -382,7 +382,7 @@ using namespace std::string_literals;
  * range query with limit (we need to do staggered querying, because
  * of how GetRecords work).
  * 
- * We can do "paged" queries (i.e. with the get_records result limit and
+ * We can do "paged" queries (i.e. with the get_stream_records result limit and
  * continuing on "next" iterator) across cdc log PK:s (id:s), if we
  * somehow track paging state. 
  *
@@ -394,10 +394,10 @@ using namespace std::string_literals;
  * It also breaks per-shard sort order, where it is assumed that
  * records in a shard are presented "in order". 
  * 
- * To deal with both problems we would need to do merging of 
+ * To deal with both problems we would need to do merging of
  * cdc streams. But this becomes difficult with actual cql paging etc,
  * we would potentially have way to many/way to few cql rows for 
- * whatever get_records query limit we have. And waste a lot of 
+ * whatever get_stream_records query limit we have. And waste a lot of 
  * memory and cycles sorting "junk".
  * 
  * For now, go simple, but maybe consider if this latter approach would work
@@ -569,7 +569,7 @@ future<executor::request_return_type> executor::describe_stream(client_state& cl
                     return std::nullopt;
                 }
                 // add this so we sort of match potential 
-                // sequence numbers in get_records result.
+                // sequence numbers in get_stream_records result.
                 return j->first + confidence_interval(db);
             }();
 
@@ -709,8 +709,8 @@ struct rapidjson::internal::TypeHelper<ValueType, alternator::shard_iterator_typ
 
 namespace alternator {
 
-future<executor::request_return_type> executor::get_shard_iterator(client_state& client_state, service_permit permit, rjson::value request) {
-    _stats.api_operations.get_shard_iterator++;
+future<executor::request_return_type> executor::get_stream_shard_iterator(client_state& client_state, service_permit permit, rjson::value request) {
+    _stats.api_operations.get_stream_shard_iterator++;
 
     auto type = rjson::get<shard_iterator_type>(request, "ShardIteratorType");
     auto seq_num = rjson::get_opt<sequence_number>(request, "SequenceNumber");
@@ -798,8 +798,8 @@ struct rapidjson::internal::TypeHelper<ValueType, alternator::event_id>
 
 namespace alternator {
     
-future<executor::request_return_type> executor::get_records(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
-    _stats.api_operations.get_records++;
+future<executor::request_return_type> executor::get_stream_records(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+    _stats.api_operations.get_stream_records++;
     auto start_time = std::chrono::steady_clock::now();
 
     auto iter = rjson::get<shard_iterator>(request, "ShardIterator");

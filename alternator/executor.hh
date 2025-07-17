@@ -196,8 +196,9 @@ public:
     future<request_return_type> describe_time_to_live(client_state& client_state, service_permit permit, rjson::value request);
     future<request_return_type> list_streams(client_state& client_state, service_permit permit, rjson::value request);
     future<request_return_type> describe_stream(client_state& client_state, service_permit permit, rjson::value request);
-    future<request_return_type> get_shard_iterator(client_state& client_state, service_permit permit, rjson::value request);
-    future<request_return_type> get_records(client_state& client_state, tracing::trace_state_ptr, service_permit permit, rjson::value request);
+    // returns a DynamoDB stream shard iterator, not to be confused with Seastar shard
+    future<request_return_type> get_stream_shard_iterator(client_state& client_state, service_permit permit, rjson::value request);
+    future<request_return_type> get_stream_records(client_state& client_state, tracing::trace_state_ptr, service_permit permit, rjson::value request);
     future<request_return_type> describe_continuous_backups(client_state& client_state, service_permit permit, rjson::value request);
 
     future<> start();

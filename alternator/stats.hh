@@ -64,8 +64,8 @@ public:
         uint64_t update_time_to_live = 0;
         uint64_t list_streams = 0;
         uint64_t describe_stream = 0;
-        uint64_t get_shard_iterator = 0;
-        uint64_t get_records = 0;
+        uint64_t get_stream_shard_iterator = 0;
+        uint64_t get_stream_records = 0;
 
 
         utils::timed_rate_moving_average_summary_and_histogram put_item_latency;
