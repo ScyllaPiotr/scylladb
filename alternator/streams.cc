@@ -216,7 +216,7 @@ future<alternator::executor::request_return_type> alternator::executor::list_str
     rjson::add(ret, "Streams", std::move(streams));
 
     // if we have more streams, we need to return the last one we visited
-    if (last_stream_arn) {
+    if (last_stream_arn && i != e) {
         rjson::add(ret, "LastEvaluatedStreamArn", *last_stream_arn);
     }
 
