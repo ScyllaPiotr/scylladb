@@ -171,8 +171,9 @@ future<alternator::executor::request_return_type> alternator::executor::list_str
     }
 
     auto i = cfs.begin();
-    auto e = cfs.end();
+    const auto e = cfs.end();
 
+    // if the request contains an ExclusiveStartStreamArn inside streams_start (with a value from an earlier response), find the right place to start
     if (streams_start) {
         i = std::find_if(i, e, [&](const data_dictionary::table& t) {
             return t.schema()->id().uuid() == streams_start
@@ -188,8 +189,9 @@ future<alternator::executor::request_return_type> alternator::executor::list_str
     auto ret = rjson::empty_object();
     auto streams = rjson::empty_array();
 
-    std::optional<stream_arn> last;
+    std::optional<stream_arn> last_stream_arn;
 
+    // Build the response
     for (;limit > 0 && i != e; ++i) {
         auto s = i->schema();
         auto& ks_name = s->ks_name();
@@ -201,8 +203,8 @@ future<alternator::executor::request_return_type> alternator::executor::list_str
         if (cdc::is_log_for_some_table(db.real_database(), ks_name, cf_name)) {
             rjson::value new_entry = rjson::empty_object();
 
-            last = i->schema()->id();
-            rjson::add(new_entry, "StreamArn", *last);
+            last_stream_arn = i->schema()->id();
+            rjson::add(new_entry, "StreamArn", *last_stream_arn);
             rjson::add(new_entry, "StreamLabel", rjson::from_string(stream_label(*s)));
             rjson::add(new_entry, "TableName", rjson::from_string(cdc::base_name(table_name(*s))));
             rjson::push_back(streams, std::move(new_entry));
@@ -213,8 +215,9 @@ future<alternator::executor::request_return_type> alternator::executor::list_str
 
     rjson::add(ret, "Streams", std::move(streams));
 
-    if (last) {
-        rjson::add(ret, "LastEvaluatedStreamArn", *last);
+    // if we have more streams, we need to return the last one we visited
+    if (last_stream_arn) {
+        rjson::add(ret, "LastEvaluatedStreamArn", *last_stream_arn);
     }
 
     return make_ready_future<executor::request_return_type>(rjson::print(std::move(ret)));
