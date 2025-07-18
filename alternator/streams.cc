@@ -223,6 +223,7 @@ future<alternator::executor::request_return_type> alternator::executor::list_str
     return make_ready_future<executor::request_return_type>(rjson::print(std::move(ret)));
 }
 
+// A struct for DynamoDB stream shard. Not to be confused with Seastar shard.
 struct shard_id {
     static constexpr auto marker = 'H';
 
@@ -253,6 +254,7 @@ shard_id::shard_id(const sstring& s) {
     id = cdc::stream_id(from_hex(s.substr(i + 1)));
 }
 
+// A class for a sequence number of a stream record in the DynamoDB stream shard
 struct sequence_number {
     utils::UUID uuid;
 
@@ -480,7 +482,7 @@ future<executor::request_return_type> executor::describe_stream(client_state& cl
         }
     } 
 
-    auto ttl = std::chrono::seconds(opts.ttl());
+    const auto ttl_period_s = std::chrono::seconds(opts.ttl());
     
     rjson::add(stream_desc, "StreamStatus", rjson::from_string(status));
 
@@ -503,7 +505,7 @@ future<executor::request_return_type> executor::describe_stream(client_state& cl
     auto normal_token_owners = _proxy.get_token_metadata_ptr()->count_normal_token_owners();
 
     // filter out cdc generations older than the table or now() - cdc::ttl (typically dynamodb_streams_max_window - 24h)
-    auto low_ts = std::max(as_timepoint(schema->id()), db_clock::now() - ttl);
+    auto low_ts = std::max(as_timepoint(schema->id()), db_clock::now() - ttl_period_s);
 
     return _sdks.cdc_get_versioned_streams(low_ts, { normal_token_owners }).then([db, shard_start, limit, ret = std::move(ret), stream_desc = std::move(stream_desc)] (std::map<db_clock::time_point, cdc::streams_version> topologies) mutable {
 
