@@ -324,6 +324,7 @@ executor::executor(gms::gossiper& gossiper,
       _cdc_metadata(cdc_metadata),
       _enforce_authorization(_proxy.data_dictionary().get_config().alternator_enforce_authorization),
       _warn_authorization(_proxy.data_dictionary().get_config().alternator_warn_authorization),
+      _audit(audit::audit::audit_instance()),
       _ssg(ssg),
       _parsed_expression_cache(std::make_unique<parsed::expression_cache>(
         parsed::expression_cache::config{_proxy.data_dictionary().get_config().alternator_max_expression_cache_entries_per_shard},
@@ -974,11 +975,19 @@ sstring executor::table_name(const schema& s) {
     return s.cf_name();
 }
 
-future<executor::request_return_type> executor::describe_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::describe_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.describe_table++;
     elogger.trace("Describing table {}", request);
 
     schema_ptr schema = get_table(_proxy, request);
+
+    // The call uses node-local info to respond, Is CL=LOCAL_ONE correct in this context?
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::QUERY, schema->ks_name(), schema->cf_name(), db::consistency_level::LOCAL_ONE);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "DescribeTable");
+        audit_info = std::move(ai);
+    }
+
     get_stats_from_schema(_proxy, *schema)->api_operations.describe_table++;
     tracing::add_alternator_table_name(trace_state, schema->cf_name());
 
@@ -1074,13 +1083,20 @@ static future<> verify_create_permission(bool enforce_authorization, bool warn_a
     }
 }
 
-future<executor::request_return_type> executor::delete_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::delete_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.delete_table++;
     elogger.trace("Deleting table {}", request);
 
     std::string table_name = get_table_name(request);
-
     std::string keyspace_name = executor::KEYSPACE_NAME_PREFIX + table_name;
+
+    // Is CL=SERIAL correct? I assume it is, since we're doing this on shard0 and obtain group0_guard. However, I'm not sure what SERIAL actually means, just deduced it.
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::DDL, keyspace_name, table_name, db::consistency_level::SERIAL);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "DeleteTable");
+        audit_info = std::move(ai);
+    }
+
     tracing::add_alternator_table_name(trace_state, table_name);
     auto& p = _proxy.container();
 
@@ -1409,7 +1425,7 @@ const std::map<sstring, sstring>& get_tags_of_table_or_throw(schema_ptr schema) 
     }
 }
 
-future<executor::request_return_type> executor::tag_resource(client_state& client_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::tag_resource(client_state& client_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.tag_resource++;
 
     const rjson::value* arn = rjson::find(request, "ResourceArn");
@@ -1417,6 +1433,14 @@ future<executor::request_return_type> executor::tag_resource(client_state& clien
         co_return api_error::access_denied("Incorrect resource identifier");
     }
     schema_ptr schema = get_table_from_arn(_proxy, rjson::to_string_view(*arn));
+
+    // Is CL=SERIAL correct? I assumed it is, since we're doing this with group0_guard. However, I'm not sure what SERIAL actually means, just deduced it.
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::DDL, schema->ks_name(), schema->cf_name(), db::consistency_level::SERIAL);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "TagResource");
+        audit_info = std::move(ai);
+    }
+
     get_stats_from_schema(_proxy, *schema)->api_operations.tag_resource++;
     const rjson::value* tags = rjson::find(request, "Tags");
     if (!tags || !tags->IsArray()) {
@@ -1432,19 +1456,26 @@ future<executor::request_return_type> executor::tag_resource(client_state& clien
     co_return ""; // empty response
 }
 
-future<executor::request_return_type> executor::untag_resource(client_state& client_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::untag_resource(client_state& client_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.untag_resource++;
 
     const rjson::value* arn = rjson::find(request, "ResourceArn");
     if (!arn || !arn->IsString()) {
         co_return api_error::access_denied("Incorrect resource identifier");
     }
+    schema_ptr schema = get_table_from_arn(_proxy, rjson::to_string_view(*arn));
+
+    // Is CL=SERIAL correct? I assumed it is, since we're doing this with group0_guard. However, I'm not sure what SERIAL actually means, just deduced it.
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::DDL, schema->ks_name(), schema->cf_name(), db::consistency_level::SERIAL);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "UntagResource");
+        audit_info = std::move(ai);
+    }
+
     const rjson::value* tags = rjson::find(request, "TagKeys");
     if (!tags || !tags->IsArray()) {
         co_return api_error::validation(format("Cannot parse tag keys"));
     }
-
-    schema_ptr schema = get_table_from_arn(_proxy, rjson::to_string_view(*arn));
     get_stats_from_schema(_proxy, *schema)->api_operations.untag_resource++;
     co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, schema, auth::permission::ALTER, _stats);
     co_await db::modify_tags(_mm, schema->ks_name(), schema->cf_name(), [tags](std::map<sstring, sstring>& tags_map) {
@@ -1453,13 +1484,21 @@ future<executor::request_return_type> executor::untag_resource(client_state& cli
     co_return ""; // empty response
 }
 
-future<executor::request_return_type> executor::list_tags_of_resource(client_state& client_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::list_tags_of_resource(client_state& client_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.list_tags_of_resource++;
     const rjson::value* arn = rjson::find(request, "ResourceArn");
     if (!arn || !arn->IsString()) {
         return make_ready_future<request_return_type>(api_error::access_denied("Incorrect resource identifier"));
     }
     schema_ptr schema = get_table_from_arn(_proxy, rjson::to_string_view(*arn));
+
+    // Uses node-local info to respond
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::QUERY, schema->ks_name(), schema->cf_name(), db::consistency_level::LOCAL_ONE);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "ListTagsOfResource");
+        audit_info = std::move(ai);
+    }
+
     get_stats_from_schema(_proxy, *schema)->api_operations.list_tags_of_resource++;
     auto tags_map = get_tags_of_table_or_throw(schema);
     rjson::value ret = rjson::empty_object();
@@ -1649,7 +1688,8 @@ static future<> mark_view_schemas_as_built(utils::chunked_vector<mutation>& out,
     }
 }
 
-future<executor::request_return_type> executor::create_table_on_shard0(service::client_state&& client_state, tracing::trace_state_ptr trace_state, rjson::value request, bool enforce_authorization, bool warn_authorization, const db::tablets_mode_t::mode tablets_mode) {
+future<executor::request_return_type> executor::create_table_on_shard0(service::client_state&& client_state, tracing::trace_state_ptr trace_state, rjson::value request, bool enforce_authorization, bool warn_authorization,
+            const db::tablets_mode_t::mode tablets_mode, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     throwing_assert(this_shard_id() == 0);
 
     // We begin by parsing and validating the content of the CreateTable
@@ -1663,6 +1703,15 @@ future<executor::request_return_type> executor::create_table_on_shard0(service::
         co_return api_error::validation(fmt::format("Prefix {} is reserved for accessing internal tables", executor::INTERNAL_TABLE_PREFIX));
     }
     std::string keyspace_name = executor::KEYSPACE_NAME_PREFIX + table_name;
+
+    // Is CL=SERIAL correct? I assumed it is, since we're doing this on shard0 and obtain group0_guard. However, I'm not sure what SERIAL actually means, just deduced it.
+    // Also, I'm currently outputting a single entry for the whole CreateTable, which can actually instantiate up to 3 items: a base table, an LSIs and a GSIs.
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::DDL, keyspace_name, table_name, db::consistency_level::SERIAL);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "CreateTable");
+        audit_info = std::move(ai);
+    }
+
     const rjson::value* attribute_definitions = rjson::find(request, "AttributeDefinitions");
     if (attribute_definitions == nullptr) {
         co_return api_error::validation("Missing AttributeDefinitions in CreateTable request");
@@ -1968,15 +2017,19 @@ future<executor::request_return_type> executor::create_table_on_shard0(service::
     co_return rjson::print(std::move(status));
 }
 
-future<executor::request_return_type> executor::create_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::create_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.create_table++;
     elogger.trace("Creating table {}", request);
 
+    // Note: audit_info is captured by reference into the invoke_on() lambda and written on shard 0.
+    // This is safe because co_await keeps the caller's coroutine frame (and audit_info) alive for
+    // the entire duration of invoke_on(). Table creation is a rare operation, so the cross-shard
+    // memory access overhead is acceptable.
     co_return co_await _mm.container().invoke_on(0, [&, tr = tracing::global_trace_state_ptr(trace_state), request = std::move(request), &e = this->container(), client_state_other_shard = client_state.move_to_other_shard(), enforce_authorization = bool(_enforce_authorization), warn_authorization = bool(_warn_authorization)]
                                         (service::migration_manager& mm) mutable -> future<executor::request_return_type> {
         const db::tablets_mode_t::mode tablets_mode = _proxy.data_dictionary().get_config().tablets_mode_for_new_keyspaces(); // type cast
         // `invoke_on` hopped us to shard 0, but `this` points to `executor` is from 'old' shard, we need to hop it too.
-        co_return co_await e.local().create_table_on_shard0(client_state_other_shard.get(), tr, std::move(request), enforce_authorization, warn_authorization, std::move(tablets_mode));
+        co_return co_await e.local().create_table_on_shard0(client_state_other_shard.get(), tr, std::move(request), enforce_authorization, warn_authorization, std::move(tablets_mode), audit_info);
     });
 }
 
@@ -2006,7 +2059,7 @@ future<executor::request_return_type> executor::create_table(client_state& clien
     }
 }
 
-future<executor::request_return_type> executor::update_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::update_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.update_table++;
     elogger.trace("Updating table {}", request);
 
@@ -2029,7 +2082,12 @@ future<executor::request_return_type> executor::update_table(client_state& clien
         verify_billing_mode(request);
     }
 
-    co_return co_await _mm.container().invoke_on(0, [&p = _proxy.container(), request = std::move(request), gt = tracing::global_trace_state_ptr(std::move(trace_state)), enforce_authorization = bool(_enforce_authorization), warn_authorization = bool(_warn_authorization), client_state_other_shard = client_state.move_to_other_shard(), empty_request, &e = this->container()]
+    // Note: audit_info is captured by reference into the invoke_on() lambda and written on shard 0.
+    // This is safe because co_await keeps the caller's coroutine frame (and audit_info) alive for
+    // the entire duration of invoke_on(). Table update is a rare operation, so the cross-shard
+    // memory access overhead is acceptable.
+    co_return co_await _mm.container().invoke_on(0, [&p = _proxy.container(), request = std::move(request), gt = tracing::global_trace_state_ptr(std::move(trace_state)), enforce_authorization = bool(_enforce_authorization),
+                warn_authorization = bool(_warn_authorization), client_state_other_shard = client_state.move_to_other_shard(), empty_request, &e = this->container(), &audit_info]
                                                 (service::migration_manager& mm) mutable -> future<executor::request_return_type> {
         schema_ptr schema;
         size_t retries = mm.get_concurrent_ddl_retries();
@@ -2037,6 +2095,13 @@ future<executor::request_return_type> executor::update_table(client_state& clien
             auto group0_guard = co_await mm.start_group0_operation();
 
             schema_ptr tab = get_table(p.local(), request);
+
+            // Is CL=SERIAL correct? I assumed it is, since we're doing this on shard0 and obtain group0_guard. However, I'm not sure what SERIAL actually means, just deduced it.
+            auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::DDL, tab->ks_name(), tab->cf_name(), db::consistency_level::SERIAL);
+            if (e.local()._audit.local().should_log(*ai)) {
+                ai->set_query_string(sstring(rjson::print(request)), "UpdateTable");
+                audit_info = std::move(ai);
+            }
 
             tracing::add_alternator_table_name(gt, tab->cf_name());
 
@@ -2966,12 +3031,22 @@ public:
     virtual ~put_item_operation() = default;
 };
 
-future<executor::request_return_type> executor::put_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::put_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.put_item++;
     auto start_time = std::chrono::steady_clock::now();
     elogger.trace("put_item {}", request);
 
     auto op = make_shared<put_item_operation>(*_parsed_expression_cache, _proxy, std::move(request));
+
+    if (!audit_info) { // we could have just jumped here from another shard, in which case we already have audit_info
+        // The op->execute() explicitly specifies LOCAL_QUORUM for mutations
+        auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::DML, op->schema()->ks_name(), op->schema()->cf_name(), db::consistency_level::LOCAL_QUORUM);
+        if (_audit.local().should_log(*ai)) {
+            ai->set_query_string(sstring(rjson::print(op->request())), "PutItem");
+            audit_info = std::move(ai);
+        }
+    }
+
     tracing::add_alternator_table_name(trace_state, op->schema()->cf_name());
     const bool needs_read_before_write = op->needs_read_before_write();
 
@@ -2983,14 +3058,14 @@ future<executor::request_return_type> executor::put_item(client_state& client_st
         _stats.api_operations.put_item--; // uncount on this shard, will be counted in other shard
         _stats.shard_bounce_for_lwt++;
         co_return co_await container().invoke_on(cas_shard->shard(), _ssg,
-                [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit)]
+                [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit), &audit_info]
                 (executor& e) mutable {
-            return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt)]
+            return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt), &audit_info]
                                      (service::client_state& client_state) mutable {
                 //FIXME: Instead of passing empty_service_permit() to the background operation,
                 // the current permit's lifetime should be prolonged, so that it's destructed
                 // only after all background operations are finished as well.
-                return e.put_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request));
+                return e.put_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request), audit_info);
             });
         });
     }
@@ -3069,12 +3144,22 @@ public:
     virtual ~delete_item_operation() = default;
 };
 
-future<executor::request_return_type> executor::delete_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::delete_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.delete_item++;
     auto start_time = std::chrono::steady_clock::now();
     elogger.trace("delete_item {}", request);
 
     auto op = make_shared<delete_item_operation>(*_parsed_expression_cache, _proxy, std::move(request));
+
+    if (!audit_info) { // we could have just jumped here from another shard, in which case we already have audit_info
+        // The op->execute() explicitly specifies LOCAL_QUORUM for mutations
+        auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::DML, op->schema()->ks_name(), op->schema()->cf_name(), db::consistency_level::LOCAL_QUORUM);
+        if (_audit.local().should_log(*ai)) {
+            ai->set_query_string(sstring(rjson::print(op->request())), "DeleteItem");
+            audit_info = std::move(ai);
+        }
+    }
+
     lw_shared_ptr<stats> per_table_stats = get_stats_from_schema(_proxy, *(op->schema()));
     tracing::add_alternator_table_name(trace_state, op->schema()->cf_name());
     const bool needs_read_before_write = _proxy.data_dictionary().get_config().alternator_force_read_before_write() || op->needs_read_before_write();
@@ -3088,14 +3173,14 @@ future<executor::request_return_type> executor::delete_item(client_state& client
         _stats.shard_bounce_for_lwt++;
         per_table_stats->shard_bounce_for_lwt++;
         co_return co_await container().invoke_on(cas_shard->shard(), _ssg,
-                [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit)]
+                [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit), &audit_info]
                 (executor& e) mutable {
-            return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt)]
+            return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt), &audit_info]
                                      (service::client_state& client_state) mutable {
                 //FIXME: Instead of passing  empty_service_permit() to the background operation,
                 // the current permit's lifetime should be prolonged, so that it's destructed
                 // only after all background operations are finished as well.
-                return e.delete_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request));
+                return e.delete_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request), audit_info);
             });
         });
     }
@@ -3311,7 +3396,19 @@ future<> executor::do_batch_write(
     }
 }
 
-future<executor::request_return_type> executor::batch_write_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+sstring print_names_for_audit(const std::set<sstring>& names) {
+    sstring res;
+    // Might have been useful to loop twice, with the 1st loop learning the total size of the names for the res to then reserve()
+    for(const auto& name : names) {
+        if (!res.empty()) {
+            res += "|";
+        }
+        res += name;
+    }
+    return res;
+}
+
+future<executor::request_return_type> executor::batch_write_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.batch_write_item++;
     auto start_time = std::chrono::steady_clock::now();
     const rjson::value& request_items = get_member(request, "RequestItems", "BatchWriteItem content");
@@ -3342,6 +3439,7 @@ future<executor::request_return_type> executor::batch_write_item(client_state& c
     // For each table, we need its stats and schema.
     std::vector<std::pair<lw_shared_ptr<stats>, schema_ptr>> per_table_wcu;
 
+    std::set<sstring> table_names; // for auditing
     mutation_builders.reserve(request_items.MemberCount());
     per_table_wcu.reserve(request_items.MemberCount());
     for (auto it = request_items.MemberBegin(); it != request_items.MemberEnd(); ++it) {
@@ -3351,6 +3449,7 @@ future<executor::request_return_type> executor::batch_write_item(client_state& c
         per_table_stats->api_operations.batch_write_item_batch_total += it->value.Size();
         per_table_stats->api_operations.batch_write_item_histogram.add(it->value.Size());
         tracing::add_alternator_table_name(trace_state, schema->cf_name());
+        table_names.insert(schema->cf_name());
 
         std::unordered_set<primary_key, primary_key_hash, primary_key_equal> used_keys(
                 1, primary_key_hash{schema}, primary_key_equal{schema});
@@ -3464,6 +3563,14 @@ future<executor::request_return_type> executor::batch_write_item(client_state& c
         rjson::add(ret, "ConsumedCapacity", std::move(consumed_capacity));
     }
     _stats.api_operations.batch_write_item_latency.mark(std::chrono::steady_clock::now() - start_time);
+    // The do_batch_write() above explicitly specifies LOCAL_QUORUM for mutations
+    // At this point, with #5650 opened, I honestly don't know if a batch write can partially succeed without reaching this point (due to throwing),
+    // which would mean the partial success is never audited.
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::DML, "", print_names_for_audit(table_names), db::consistency_level::LOCAL_QUORUM);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "BatchWriteItem");
+        audit_info = std::move(ai);
+    }
     co_return rjson::print(std::move(ret));
 }
 
@@ -4604,12 +4711,22 @@ std::optional<mutation> update_item_operation::apply(std::unique_ptr<rjson::valu
     return m;
 }
 
-future<executor::request_return_type> executor::update_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::update_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.update_item++;
     auto start_time = std::chrono::steady_clock::now();
     elogger.trace("update_item {}", request);
 
     auto op = make_shared<update_item_operation>(*_parsed_expression_cache, _proxy, std::move(request));
+
+    if (!audit_info) { // we could have just jumped here from another shard, in which case we already have audit_info
+        // The op->execute() explicitly specifies LOCAL_QUORUM for mutations
+        auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::DML, op->schema()->ks_name(), op->schema()->cf_name(), db::consistency_level::LOCAL_QUORUM);
+        if (_audit.local().should_log(*ai)) {
+            ai->set_query_string(sstring(rjson::print(op->request())), "UpdateItem");
+            audit_info = std::move(ai);
+        }
+    }
+
     tracing::add_alternator_table_name(trace_state, op->schema()->cf_name());
     const bool needs_read_before_write = _proxy.data_dictionary().get_config().alternator_force_read_before_write() || op->needs_read_before_write();
 
@@ -4621,14 +4738,14 @@ future<executor::request_return_type> executor::update_item(client_state& client
         _stats.api_operations.update_item--; // uncount on this shard, will be counted in other shard
         _stats.shard_bounce_for_lwt++;
         co_return co_await container().invoke_on(cas_shard->shard(), _ssg,
-                [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit)]
+                [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit), &audit_info]
                 (executor& e) mutable {
-            return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt)]
+            return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt), &audit_info]
                                      (service::client_state& client_state) mutable {
                 //FIXME: Instead of passing empty_service_permit() to the background operation,
                 // the current permit's lifetime should be prolonged, so that it's destructed
                 // only after all background operations are finished as well.
-                return e.update_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request));
+                return e.update_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request), audit_info);
             });
         });
     }
@@ -4683,7 +4800,7 @@ static rjson::value describe_item(schema_ptr schema,
     return item_descr;
 }
 
-future<executor::request_return_type> executor::get_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::get_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.get_item++;
     auto start_time = std::chrono::steady_clock::now();
     elogger.trace("Getting item {}", request);
@@ -4695,6 +4812,12 @@ future<executor::request_return_type> executor::get_item(client_state& client_st
 
     rjson::value& query_key = request["Key"];
     db::consistency_level cl = get_read_consistency(request);
+
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::QUERY, schema->ks_name(), schema->cf_name(), cl);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "GetItem");
+        audit_info = std::move(ai);
+    }
 
     partition_key pk = pk_from_json(query_key, schema);
     dht::partition_range_vector partition_ranges{dht::partition_range(dht::decorate_key(*schema, pk))};
@@ -4795,7 +4918,7 @@ static void check_big_object(const rjson::value& val, int& size_left) {
     }
 }
 
-future<executor::request_return_type> executor::batch_get_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::batch_get_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     // FIXME: In this implementation, an unbounded batch size can cause
     // unbounded response JSON object to be buffered in memory, unbounded
     // parallelism of the requests, and unbounded amount of non-preemptable
@@ -4910,7 +5033,7 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     // from one of the operations will be returned.
     bool some_succeeded = false;
     std::exception_ptr eptr;
-
+    std::set<sstring> table_names; // for auditing
     rjson::value response = rjson::empty_object();
     rjson::add(response, "Responses", rjson::empty_object());
     rjson::add(response, "UnprocessedKeys", rjson::empty_object());
@@ -4919,6 +5042,7 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     for (size_t i = 0; i < requests.size(); i++) {
         const table_requests& rs = requests[i];
         std::string table = table_name(*rs.schema);
+        table_names.insert(table);
         for (const auto& [_, cks] : rs.requests) {
             auto& fut = *fut_it;
             ++fut_it;
@@ -4971,6 +5095,13 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
         rjson::add(response, "ConsumedCapacity", std::move(consumed_capacity));
     }
     elogger.trace("Unprocessed keys: {}", response["UnprocessedKeys"]);
+    // FIXME: CL is set per request by get_read_consistency() above, but here we pass the placeholder value ANY
+    // FIXME: Auditing is executed only for a complete success
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::QUERY, "", print_names_for_audit(table_names), db::consistency_level::ANY);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "BatchGetItem");
+        audit_info = std::move(ai);
+    }
     if (!some_succeeded && eptr) {
         co_await coroutine::return_exception_ptr(std::move(eptr));
     }
@@ -5439,11 +5570,19 @@ static dht::partition_range get_range_for_segment(int segment, int total_segment
     }
 }
 
-future<executor::request_return_type> executor::scan(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::scan(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.scan++;
     elogger.trace("Scanning {}", request);
 
     auto [schema, table_type] = get_table_or_view(_proxy, request);
+    db::consistency_level cl = get_read_consistency(request);
+
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::QUERY, schema->ks_name(), schema->cf_name(), cl);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "Scan");
+        audit_info = std::move(ai);
+    }
+
     tracing::add_alternator_table_name(trace_state, schema->cf_name());
     get_stats_from_schema(_proxy, *schema)->api_operations.scan++;
     auto segment = get_int_attribute(request, "Segment");
@@ -5465,7 +5604,6 @@ future<executor::request_return_type> executor::scan(client_state& client_state,
 
     rjson::value* exclusive_start_key = rjson::find(request, "ExclusiveStartKey");
 
-    db::consistency_level cl = get_read_consistency(request);
     if (table_type == table_or_view_type::gsi && cl != db::consistency_level::LOCAL_ONE) {
         return make_ready_future<request_return_type>(api_error::validation(
                 "Consistent reads are not allowed on global indexes (GSI)"));
@@ -5918,16 +6056,23 @@ calculate_bounds_condition_expression(schema_ptr schema,
     return {std::move(partition_ranges), std::move(ck_bounds)};
 }
 
-future<executor::request_return_type> executor::query(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::query(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.query++;
     elogger.trace("Querying {}", request);
 
     auto [schema, table_type] = get_table_or_view(_proxy, request);
+    db::consistency_level cl = get_read_consistency(request);
+
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::QUERY, schema->ks_name(), schema->cf_name(), cl);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "Query");
+        audit_info = std::move(ai);
+    }
+
     get_stats_from_schema(_proxy, *schema)->api_operations.query++;
     tracing::add_alternator_table_name(trace_state, schema->cf_name());
 
     rjson::value* exclusive_start_key = rjson::find(request, "ExclusiveStartKey");
-    db::consistency_level cl = get_read_consistency(request);
     if (table_type == table_or_view_type::gsi && cl != db::consistency_level::LOCAL_ONE) {
         return make_ready_future<request_return_type>(api_error::validation(
                 "Consistent reads are not allowed on global indexes (GSI)"));
@@ -5996,9 +6141,15 @@ future<executor::request_return_type> executor::query(client_state& client_state
             std::move(filter), opts, client_state, _stats, std::move(trace_state), std::move(permit), _enforce_authorization, _warn_authorization);
 }
 
-future<executor::request_return_type> executor::list_tables(client_state& client_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::list_tables(client_state& client_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.list_tables++;
     elogger.trace("Listing tables {}", request);
+
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::QUERY, "", "", db::consistency_level::LOCAL_ONE);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "ListTables");
+        audit_info = std::move(ai);
+    }
 
     co_await utils::get_local_injector().inject("alternator_list_tables", [] (auto& handler) -> future<> {
         handler.set("waiting", true);
@@ -6055,8 +6206,15 @@ future<executor::request_return_type> executor::list_tables(client_state& client
     co_return rjson::print(std::move(response));
 }
 
-future<executor::request_return_type> executor::describe_endpoints(client_state& client_state, service_permit permit, rjson::value request, std::string host_header) {
+future<executor::request_return_type> executor::describe_endpoints(client_state& client_state, service_permit permit, rjson::value request, std::string host_header, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.describe_endpoints++;
+
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::QUERY, "", "", db::consistency_level::LOCAL_ONE);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "DescribeEndpoints");
+        audit_info = std::move(ai);
+    }
+
     // The alternator_describe_endpoints configuration can be used to disable
     // the DescribeEndpoints operation, or set it to return a fixed string
     std::string override = _proxy.data_dictionary().get_config().alternator_describe_endpoints();
@@ -6093,15 +6251,21 @@ static locator::replication_strategy_config_options get_network_topology_options
     return options;
 }
 
-future<executor::request_return_type> executor::describe_continuous_backups(client_state& client_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::describe_continuous_backups(client_state& client_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_cl>& audit_info) {
     _stats.api_operations.describe_continuous_backups++;
     // Unlike most operations which return ResourceNotFound when the given
     // table doesn't exists, this operation returns a TableNoteFoundException.
     // So we can't use the usual get_table() wrapper and need a bit more code:
     std::string table_name = get_table_name(request);
+    sstring ks_name = sstring(executor::KEYSPACE_NAME_PREFIX) + table_name;
+    auto ai = std::make_unique<audit::audit_info_cl>(audit::statement_category::QUERY, ks_name, table_name, db::consistency_level::LOCAL_ONE);
+    if (_audit.local().should_log(*ai)) {
+        ai->set_query_string(sstring(rjson::print(request)), "DescribeContinuousBackups");
+        audit_info = std::move(ai);
+    }
     schema_ptr schema;
     try {
-        schema = _proxy.data_dictionary().find_schema(sstring(executor::KEYSPACE_NAME_PREFIX) + table_name, table_name);
+        schema = _proxy.data_dictionary().find_schema(ks_name, table_name);
     } catch(data_dictionary::no_such_column_family&) {
         // DynamoDB returns validation error even when table does not exist
         // and the table name is invalid.
