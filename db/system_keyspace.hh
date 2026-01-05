@@ -455,7 +455,7 @@ public:
     // For this purpose, records of cleanup operations (the affected token ranges
     // and commitlog ranges) are kept in a system table.
     //
-    // The below functions manipulate these records. 
+    // The below functions manipulate these records.
 
     // Saves a record of a token range affected by cleanup.
     // After reboot, tokens from this range will be replayed only if they are on replay positions
@@ -585,6 +585,17 @@ public:
 
     future<> read_cdc_streams_state(std::optional<table_id> table, noncopyable_function<future<>(table_id, db_clock::time_point, utils::chunked_vector<cdc::stream_id>)> f);
     future<> read_cdc_streams_history(table_id table, std::optional<db_clock::time_point> from, noncopyable_function<future<>(table_id, db_clock::time_point, cdc::cdc_stream_diff)> f);
+
+    // Reads current generation timestamp for the given table. Throws runtime_error (see `cql3::untyped_result_set::one()`) if table not found.
+    // NOTE: there's a sibling `cdc_current_generation_timestamp` in `system_distributed_keyspace`, that does the same for tables backed up by vnodes.
+    future<db_clock::time_point> read_cdc_for_tablets_current_generation_timestamp(std::string_view ks_name, std::string_view table_name);
+
+    // Reads and builds generation map for a given table - a map from generation timestamps to vector of all stream ids for that generation.
+    // All cdc generations with timestamp less than `not_older_than` will be ignored.
+    // If `not_older_than` is not provided, all generations will be returned.
+    // Returns empty map if table is not found or if there are no generations with timestamp less than `not_older_than`.
+    // NOTE: there's a sibling `cdc_get_versioned_streams`, that reads the same data for tables backed by legacy vnodes. The data returned is the same.
+    future<std::map<db_clock::time_point, cdc::streams_version>> read_cdc_for_tablets_versioned_streams(std::string_view ks_name, std::string_view table_name, db_clock::time_point not_older_than = db_clock::time_point::min());
 
     // Load Raft Group 0 id from scylla.local
     future<utils::UUID> get_raft_group0_id();
