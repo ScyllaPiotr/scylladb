@@ -291,7 +291,6 @@ def test_describe_stream_with_nonexistent_last_shard(dynamodb, dynamodbstreams):
 # only delete column from non-existing item emits spurious MODIFY event
 # test requires `alternator_streams_increased_compatibility` set to be true, otherwise will fail
 # Reproduces #28368
-@pytest.mark.xfail(reason="fix-coming-in-next-commit")
 def test_streams_spurious_modify_when_update_expr_on_missing_item(test_table_ss_new_and_old_images, dynamodb, dynamodbstreams):
     null = None
     def do_updates(table, p, c):
@@ -356,7 +355,6 @@ def test_streams_spurious_modify_when_update_expr_on_missing_item_on_no_clusteri
 # as it was only able to drop all changes, not part of them
 # the test requires write isolation to be always, as this triggers different (faulty) code path
 # reproduces #28452
-@pytest.mark.xfail(reason="fix-coming-in-next-commit")
 @pytest.mark.xfail(reason="Issue #28452: this test requires batch item squash bug fixed")
 def test_streams_spurious_modify_mixing_noop_with_real_changes_in_batch_write_item(test_table_ss_new_and_old_images_write_isolation_always, dynamodb, dynamodbstreams):
     def do_updates(table, p, c):
