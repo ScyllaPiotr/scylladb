@@ -6,6 +6,7 @@
 
 import time
 
+from botocore.exceptions import ClientError
 import pytest
 from cassandra import InvalidRequest
 
@@ -131,6 +132,19 @@ def _assert_audit_entries(rows, expected, ks_name=None, table_name=None):
         # that should all appear in the operation text.
         for fragment in expected_fragments:
             assert fragment in actual_operation, f"Expected substring '{fragment}' not found in operation {actual_operation}"
+
+
+# Assert that no entries in `rows` match the given filters.
+# Used by negative (unhappy-path) tests to verify that operations which should
+# NOT be audited did not produce any audit entries.
+def _assert_no_audit_entries_for(rows, ks_name=None, table_name=None, category=None):
+    matching = [r for r in rows if
+        (ks_name is None or r.keyspace_name == ks_name) and
+        (table_name is None or r.table_name == table_name) and
+        (category is None or r.category == category)]
+    assert len(matching) == 0, (
+        f"Expected no audit entries matching ks={ks_name}, table={table_name}, "
+        f"category={category}, but found {len(matching)}: {_simplify_rows(matching)}")
 
 
 # system.config stores values as JSON-encoded strings with surrounding quotes.
@@ -514,3 +528,163 @@ def test_audit_streams_operations(scylla_only, dynamodb, dynamodbstreams, cql, a
         # Each individual Alternator call above must be audited.
         new_rows = _get_new_audit_log_rows(cql, before_rows, expected_new_row_count=len(expected))
         _assert_audit_entries(new_rows, expected)
+
+
+# --- Unhappy-path / negative tests ---
+# The tests below verify that audit entries are NOT generated when the audit
+# configuration should filter them out, and that error entries are recorded
+# correctly.
+
+
+# Test that operations whose category is excluded from audit_categories are NOT logged.
+# Each phase enables only one category and performs both a positive (should-be-logged)
+# and a negative (should-NOT-be-logged) operation. The negative event is performed first;
+# once the positive event's audit entry arrives, the absence of the negative entry is
+# conclusive — they share the same audit pipeline.
+def test_audit_category_filtering(scylla_only, dynamodb, cql, alternator_audit_enabled):
+    with new_test_table(dynamodb, **HASH_AND_RANGE_SCHEMA) as table:
+        ks_name = f"alternator_{table.name}"
+        tab = dynamodb.Table(table.name)
+        client = table.meta.client
+        # Pre-populate so reads return data.
+        tab.put_item(Item={"p": "pk_0", "c": "ck_0", "v": "val"})
+        cql.execute("UPDATE system.config SET value=%s WHERE name='audit_keyspaces'", (ks_name,))
+
+        # Phase A: DML excluded (only QUERY enabled).
+        cql.execute("UPDATE system.config SET value=%s WHERE name='audit_categories'", ("QUERY",))
+        before_rows = _get_audit_log_rows(cql)
+        # Negative: PutItem is DML — should NOT be logged.
+        tab.put_item(Item={"p": "pk_neg", "c": "ck_neg", "v": "neg"})
+        # Positive: GetItem is QUERY — should be logged.
+        tab.get_item(Key={"p": "pk_0", "c": "ck_0"})
+        expected_a = [("QUERY", "LOCAL_ONE", False, ks_name, table.name, ["GetItem", "pk_0", "ck_0"])]
+        new_rows = _get_new_audit_log_rows(cql, before_rows, expected_new_row_count=1)
+        _assert_audit_entries(new_rows, expected_a, ks_name, table.name)
+        _assert_no_audit_entries_for(new_rows, category="DML")
+        with pytest.raises(AssertionError):
+            _assert_no_audit_entries_for(new_rows, category="QUERY")  # sanity check
+
+        # Phase B: QUERY excluded (only DML enabled).
+        cql.execute("UPDATE system.config SET value=%s WHERE name='audit_categories'", ("DML",))
+        before_rows = _get_audit_log_rows(cql)
+        # Negative: GetItem is QUERY — should NOT be logged.
+        tab.get_item(Key={"p": "pk_0", "c": "ck_0"})
+        # Positive: PutItem is DML — should be logged.
+        tab.put_item(Item={"p": "pk_pos_b", "c": "ck_pos_b", "v": "pos_b"})
+        expected_b = [("DML", "LOCAL_QUORUM", False, ks_name, table.name, ["PutItem", "pk_pos_b"])]
+        new_rows = _get_new_audit_log_rows(cql, before_rows, expected_new_row_count=1)
+        _assert_audit_entries(new_rows, expected_b, ks_name, table.name)
+        _assert_no_audit_entries_for(new_rows, category="QUERY")
+        with pytest.raises(AssertionError):
+            _assert_no_audit_entries_for(new_rows, category="DML")  # sanity check
+
+        # Phase C: DDL excluded (only DML and QUERY enabled).
+        cql.execute("UPDATE system.config SET value=%s WHERE name='audit_categories'", ("DML,QUERY",))
+        before_rows = _get_audit_log_rows(cql)
+        # Get table ARN for TagResource (a DDL operation).
+        desc = client.describe_table(TableName=table.name)
+        table_arn = desc['Table']['TableArn']
+        # Negative: TagResource is DDL — should NOT be logged.
+        client.tag_resource(ResourceArn=table_arn, Tags=[{"Key": "env", "Value": "test"}])
+        # Positive: PutItem is DML — should be logged.
+        # Note: DescribeTable above is QUERY and will also be logged.
+        tab.put_item(Item={"p": "pk_pos_c", "c": "ck_pos_c", "v": "pos_c"})
+        expected_c = [
+            ("QUERY", "LOCAL_ONE", False, ks_name, table.name, ["DescribeTable", table.name]),
+            ("DML", "LOCAL_QUORUM", False, ks_name, table.name, ["PutItem", "pk_pos_c"]),
+        ]
+        new_rows = _get_new_audit_log_rows(cql, before_rows, expected_new_row_count=2)
+        _assert_audit_entries(new_rows, expected_c, ks_name, table.name)
+        _assert_no_audit_entries_for(new_rows, category="DDL")
+        with pytest.raises(AssertionError):
+            _assert_no_audit_entries_for(new_rows, category="DML")  # sanity check
+        with pytest.raises(AssertionError):
+            _assert_no_audit_entries_for(new_rows, category="QUERY")  # sanity check
+        # Clean up tag.
+        client.untag_resource(ResourceArn=table_arn, TagKeys=["env"])
+
+
+# Test that operations on a keyspace NOT listed in audit_keyspaces are NOT logged.
+# Two tables are created; audit_keyspaces is set to only one table's keyspace.
+# Operations on the non-audited table should produce no entries, while operations
+# on the audited table (positive canary) confirm the audit pipeline is working.
+def test_audit_keyspace_filtering(scylla_only, dynamodb, cql, alternator_audit_enabled):
+    with new_test_table(dynamodb, **HASH_ONLY_SCHEMA) as table_a:
+        with new_test_table(dynamodb, **HASH_ONLY_SCHEMA) as table_b:
+            ks_a = f"alternator_{table_a.name}"
+            ks_b = f"alternator_{table_b.name}"
+            tab_a = dynamodb.Table(table_a.name)
+            tab_b = dynamodb.Table(table_b.name)
+            # Audit only table_a's keyspace.
+            cql.execute("UPDATE system.config SET value=%s WHERE name='audit_keyspaces'", (ks_a,))
+            before_rows = _get_audit_log_rows(cql)
+            # Negative: operations on table_b (wrong keyspace) — should NOT be logged.
+            tab_b.put_item(Item={"p": "pk_b"})
+            tab_b.get_item(Key={"p": "pk_b"})
+            # Positive: PutItem on table_a (correct keyspace) — should be logged.
+            tab_a.put_item(Item={"p": "pk_a"})
+            expected = [("DML", "LOCAL_QUORUM", False, ks_a, table_a.name, ["PutItem", "pk_a"])]
+            new_rows = _get_new_audit_log_rows(cql, before_rows, expected_new_row_count=1)
+            _assert_audit_entries(new_rows, expected, ks_a, table_a.name)
+            _assert_no_audit_entries_for(new_rows, ks_name=ks_b)
+            with pytest.raises(AssertionError):
+                _assert_no_audit_entries_for(new_rows, ks_name=ks_a)  # sanity check
+
+
+# Test that a failed operation (one that throws after audit_info is set) generates
+# an audit entry with error=True.
+# GetItem with an extra bogus key attribute passes table lookup (audit_info is set)
+# but then check_key() throws ValidationException. A normal GetItem follows as the
+# positive canary (error=False). Both entries should be present.
+def test_audit_error_entry(scylla_only, dynamodb, cql, alternator_audit_enabled):
+    with new_test_table(dynamodb, **HASH_ONLY_SCHEMA) as table:
+        ks_name = f"alternator_{table.name}"
+        tab = dynamodb.Table(table.name)
+        # Insert data so the successful GetItem has something to return.
+        tab.put_item(Item={"p": "pk_0"})
+        cql.execute("UPDATE system.config SET value=%s WHERE name='audit_keyspaces'", (ks_name,))
+        before_rows = _get_audit_log_rows(cql)
+        # Negative operation: GetItem with an extra key attribute beyond the schema.
+        # The table has only "p" as the hash key, so passing "bogus" triggers check_key()
+        # which throws api_error::validation after audit_info is already set.
+        with pytest.raises(ClientError, match='ValidationException'):
+            tab.get_item(Key={"p": "pk_0", "bogus": "junk"})
+        # Positive operation: normal GetItem — should succeed and produce error=False entry.
+        tab.get_item(Key={"p": "pk_0"})
+        expected = [
+            ("QUERY", "LOCAL_ONE", True, ks_name, table.name, ["GetItem", "pk_0", "bogus"]),
+            ("QUERY", "LOCAL_ONE", False, ks_name, table.name, ["GetItem", "pk_0"]),
+        ]
+        new_rows = _get_new_audit_log_rows(cql, before_rows, expected_new_row_count=2)
+        _assert_audit_entries(new_rows, expected, ks_name, table.name)
+
+
+# Test that operations with empty keyspace (ListTables, DescribeEndpoints) are
+# logged regardless of what audit_keyspaces is configured to, because the
+# should_log() function short-circuits on keyspace().empty().
+# Meanwhile, operations with a non-empty keyspace that is NOT in audit_keyspaces
+# should NOT be logged.
+def test_audit_empty_keyspace_bypass(scylla_only, dynamodb, cql, alternator_audit_enabled):
+    with new_test_table(dynamodb, **HASH_ONLY_SCHEMA) as table:
+        ks_name = f"alternator_{table.name}"
+        tab = dynamodb.Table(table.name)
+        client = table.meta.client
+        # Set audit_keyspaces to an unrelated keyspace — NOT the table's keyspace
+        # and NOT an empty string. This means table-scoped operations on our table
+        # should be filtered out, but empty-keyspace operations should still pass.
+        cql.execute("UPDATE system.config SET value=%s WHERE name='audit_keyspaces'", ("nonexistent_ks",))
+        before_rows = _get_audit_log_rows(cql)
+        # Negative: PutItem on the table (non-empty keyspace, not in audit_keyspaces) — should NOT be logged.
+        tab.put_item(Item={"p": "pk_0"})
+        # Positive: ListTables and DescribeEndpoints (empty keyspace) — should be logged.
+        client.list_tables()
+        client.describe_endpoints()
+        expected = [
+            ("QUERY", "LOCAL_ONE", False, "", "", ["ListTables"]),
+            ("QUERY", "LOCAL_ONE", False, "", "", ["DescribeEndpoints"]),
+        ]
+        new_rows = _get_new_audit_log_rows(cql, before_rows, expected_new_row_count=2)
+        _assert_audit_entries(new_rows, expected)
+        _assert_no_audit_entries_for(new_rows, ks_name=ks_name)
+        with pytest.raises(AssertionError):
+            _assert_no_audit_entries_for(new_rows, ks_name="")  # sanity check
