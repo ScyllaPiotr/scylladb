@@ -808,7 +808,16 @@ async def test_index_requires_rf_rack_valid_keyspace(manager: ManagerClient):
 
     # Create a table with tablets and no indexes, then add a GSI - the update should fail
     table_name = unique_table_name()
-    create_table_with_index(alternator, table_name, index_type=None, initial_tablets='1')
+    # The server waits 10s for schema agreement after creating a table,
+    # which may not be enough after a sequence of rapid schema changes
+    # on a multi-node cluster (see SCYLLADB-1135). Retry if needed.
+    for attempt in range(2):
+        try:
+            create_table_with_index(alternator, table_name, index_type=None, initial_tablets='1')
+            break
+        except ClientError as e:
+            if 'schema agreement' not in str(e) or attempt == 1:
+                raise
     with pytest.raises(ClientError, match=expected_err_update_add_gsi):
         alternator.meta.client.update_table(
             TableName=table_name,
