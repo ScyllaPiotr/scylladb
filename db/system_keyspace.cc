@@ -2055,6 +2055,10 @@ future<std::unordered_set<dht::token>> system_keyspace::get_local_tokens() {
     });
 }
 
+// Tablet-based counterpart of system_distributed_keyspace::cdc_current_generation_timestamp.
+// Unlike the vnode version which reads from a replicated system_distributed table (and thus
+// requires QUORUM), this reads from a virtual table backed by local Raft-managed tablet
+// metadata, so consistency_level::ONE is the only meaningful level.
 future<db_clock::time_point> system_keyspace::read_cdc_for_tablets_current_generation_timestamp(std::string_view ks_name, std::string_view table_name) {
     // note: we only care about the newest ("current") timestamp, hence limit 1.
     static const sstring query = format("SELECT timestamp FROM {}.{} WHERE keyspace_name = ? and table_name = ? limit 1", NAME, CDC_TIMESTAMPS);
@@ -2067,6 +2071,10 @@ future<db_clock::time_point> system_keyspace::read_cdc_for_tablets_current_gener
     co_return timestamp_cql->one().get_as<db_clock::time_point>("timestamp");
 }
 
+// Tablet-based counterpart of system_distributed_keyspace::cdc_get_versioned_streams.
+// Unlike the vnode version which reads from a replicated system_distributed table (and thus
+// requires QUORUM), this reads from a virtual table backed by local Raft-managed tablet
+// metadata, so consistency_level::ONE is the only meaningful level.
 future<std::map<db_clock::time_point, cdc::streams_version>> system_keyspace::read_cdc_for_tablets_versioned_streams(std::string_view ks_name, std::string_view table_name, db_clock::time_point not_older_than) {
     static const sstring stream_id_query = format("SELECT stream_id, stream_state, timestamp FROM {}.{} WHERE keyspace_name = ? and table_name = ?", NAME, CDC_STREAMS);
 
