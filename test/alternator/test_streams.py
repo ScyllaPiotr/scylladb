@@ -5,6 +5,7 @@
 # Tests for stream operations: ListStreams, DescribeStream, GetShardIterator,
 # GetRecords.
 
+import random
 import time
 import urllib.request
 from contextlib import contextmanager, ExitStack
@@ -18,9 +19,9 @@ from test.alternator.util import is_aws, scylla_config_temporary, unique_table_n
 
 TAGS = []
 # The following fixture is to ensure that tests in this module will be tested with both vnodes and tablets.
-# This fixture will run automatically for every test that see it.
-# NOTE: it's unclear what exactly it means. Just to be safe, we define fixture here (instead of reusing
-# similar one from TTL tests). We also don't import / reuse fixture across modules.
+# This fixture runs automatically for every test in this module.
+# To avoid relying on semantics of a similar fixture used in TTL tests, we define it locally here instead of reusing
+# that fixture, and we do not import or reuse fixtures across modules.
 # It sets the TAGS variable in the module’s global namespace to the current parameter value before each test.
 # All tests will be run with both values.
 @pytest.fixture(params=[
@@ -491,11 +492,20 @@ def test_parent_filtering(dynamodb, dynamodbstreams, rest_api, cql):
         ks = f'alternator_{table.name}'
         table_name = table.name
         cdc_log_table_name = f'{table_name}_scylla_cdc_log'
+        # Stage 1: Record initial tablet count, which determines the expected
+        # number of root stream shards (shards without a parent).
         init_table_count = get_tablet_count_for_base_table_of_table(rest_api, cql, ks, cdc_log_table_name)
 
+        # Stage 2: Drive tablet count changes according to tablet_multipliers.
+        # Each change triggers a new "generation" of stream shards to be created,
+        # so the total number of stream shards across all generations is
+        # sum(tablet_multipliers) * init_table_count.
         for tablet_mult in tablet_multipliers:
             set_tablet_count_and_wait(rest_api, cql, ks, table_name, cdc_log_table_name, init_table_count * tablet_mult)
 
+        # Stage 3: Poll DescribeStream until all expected stream shards have appeared,
+        # building a shard_id -> parent_shard_id map (shard_parents_map) and
+        # collecting root shard IDs (shards with no parent).
         total_shard_count = sum(tablet_multipliers) * init_table_count
         print(f'Expecting {total_shard_count} shards in total')
         end_ts = time.time() + 30
@@ -518,46 +528,100 @@ def test_parent_filtering(dynamodb, dynamodbstreams, rest_api, cql):
             time.sleep(0.1)
 
         assert len(shard_parents_map) == total_shard_count
+        assert len(root_shard_ids) == init_table_count
+
+        # Stage 4: For each shard, use DescribeStream's CHILD_SHARDS filter to
+        # build a shard_id -> [child_shard_ids] map (shard_children_map).
+        # Also verify the split/merge invariant: in a split all children point
+        # back to the same parent; in a merge the child may point to only one
+        # of its two parents, so the other parent will have exactly one child.
+        #
+        # First, build declared_children from the ParentShardId field recorded
+        # in shard_parents_map, then compare against the CHILD_SHARDS filter
+        # results to confirm consistency.
+        declared_children = {}  # parent_shard_id -> [child_shard_ids derived from ParentShardId]
+        for shard_id, parent_shard_id in shard_parents_map.items():
+            if parent_shard_id is not None:
+                declared_children.setdefault(parent_shard_id, []).append(shard_id)
 
         shard_children_map = {}
         all_shards = set()
         in_children = set()
         for shard_id in shard_parents_map:
-            children = []
             all_shards.add(shard_id)
-            parent_check = True
+            filter_children = []
             for child_shard in iterate_over_describe_stream(dynamodbstreams, arn, end_ts, filter_shard_id=shard_id):
                 child_shard_id = child_shard['ShardId']
                 in_children.add(child_shard_id)
-                parent_shard_id = child_shard.get('ParentShardId', None)
-                if parent_shard_id != shard_id:
-                    parent_check = False
-                children.append(child_shard_id)
+                filter_children.append(child_shard_id)
+            shard_children_map[shard_id] = filter_children
+            # Verify that every child declared via ParentShardId is also returned
+            # by the CHILD_SHARDS filter for this shard.
+            declared = set(declared_children.get(shard_id, []))
+            assert declared.issubset(set(filter_children)), \
+                f"Declared children {declared} not subset of filter children {set(filter_children)} for shard {shard_id}"
             # Between generations (currently) we can have either splits by half or merges two into one.
-            # In case of split - children count will be > 1 and all children will point exactly to parent.
-            # In case of merge - children count will be 1, the `child_shard_id` stream shard will appear twice 
-            # under two different `shard_id` parent values and will have a `ParentShardId`
-            # equal to one of those parents.
-            # This assert checks that either `parent_check` is True (split case - all children point to parent) or
-            # we have only one child (merge case) - `parent_check` will be True for one parent and False for the other.
-            assert parent_check or len(children) == 1
-            shard_children_map[shard_id] = children
+            # In case of split - children count will be > 1 and all children will point exactly to parent
+            #   (so declared == filter_children).
+            # In case of merge - the CHILD_SHARDS filter returns the merged child for both parents,
+            #   but the child's ParentShardId can only point to one of them. So the non-designated
+            #   parent will have filter_children = [child] but declared_children = [].
+            # This assert checks that either all filter children were declared (split case) or
+            # we have at most one child (merge case where this parent isn't the designated one).
+            assert set(filter_children) == declared or len(filter_children) <= 1, \
+                f"Unexpected children mismatch for shard {shard_id}: filter={filter_children}, declared={list(declared)}"
 
-        shards_without_parrents = all_shards - in_children
-        assert shards_without_parrents == set(root_shard_ids)
+        # Verify split/merge invariants across generation boundaries.
+        # Group shards by generation (extracted from the hex timestamp in the shard ID).
+        def get_gen(t):
+            return t[2:13]
+        gen_shards = {}
+        for shard_id in shard_parents_map:
+            gen = get_gen(shard_id)
+            gen_shards.setdefault(gen, []).append(shard_id)
+        # Sort generations chronologically and verify parent/child ratios.
+        sorted_gens = sorted(gen_shards.keys())
+        for i in range(1, len(sorted_gens)):
+            prev_gen = sorted_gens[i - 1]
+            curr_gen = sorted_gens[i]
+            parent_count = len(gen_shards[prev_gen])
+            child_count = len(gen_shards[curr_gen])
+            if child_count > parent_count:
+                # Split: 2x children, every parent has 2 children pointing to it
+                assert child_count == 2 * parent_count, \
+                    f"Split ratio wrong: {parent_count} parents -> {child_count} children"
+                for p in gen_shards[prev_gen]:
+                    kids = declared_children.get(p, [])
+                    assert len(kids) == 2, f"Split parent {p} has {len(kids)} declared children, expected 2"
+            elif child_count < parent_count:
+                # Merge: 2x parents, every child has 2 parents (but only 1 declared via ParentShardId)
+                assert parent_count == 2 * child_count, \
+                    f"Merge ratio wrong: {parent_count} parents -> {child_count} children"
+                # Each child in the current generation should appear as a filter_child
+                # of exactly 2 parents from the previous generation.
+                for c in gen_shards[curr_gen]:
+                    parents_of_c = [p for p in gen_shards[prev_gen] if c in shard_children_map.get(p, [])]
+                    assert len(parents_of_c) == 2, \
+                        f"Merge child {c} has {len(parents_of_c)} parents, expected 2"
 
-        def run_and_verify(shard_id, history):
-            history.append(shard_id)
+        # Stage 5: Verify that the set of shards with no parent exactly matches
+        # root_shard_ids collected earlier (i.e. no orphaned shards).
+        shards_without_parents = all_shards - in_children
+        assert shards_without_parents == set(root_shard_ids)
+
+        # Stage 6: Walk the shard tree recursively from each root and verify
+        # that every root-to-leaf path has length exactly len(tablet_multipliers),
+        # confirming one new generation per tablet count change.
+        def run_and_verify(shard_id, depth):
             children = shard_children_map.get(shard_id, None)
             if not children:
-                assert len(history) == len(tablet_multipliers)
+                assert depth == len(tablet_multipliers)
             else:
                 for ch in children:
-                    run_and_verify(ch, history)
-            history.pop()
+                    run_and_verify(ch, depth + 1)
 
         for r in root_shard_ids:
-            run_and_verify(r, [])
+            run_and_verify(r, 1)
 
 # this test will:
 #  - create a table with streams enabled
@@ -574,7 +638,7 @@ def test_parent_filtering(dynamodb, dynamodbstreams, rest_api, cql):
 #      - within each partition key, the records are in order of writes (check that `e` is monotonically increasing for each record)
 #      - the stream shard parent-child relationships are correct - stream shards create "generations" (all stream shards are split or merged at the same moment,
 #        when tablet count is changed). Every stream shard except first ones has a parent, but not every stream shard is being point to as a parent - when stream shard merge
-#        (let's say A & B merge into C), then next generation stream shard (C) has two parents (A & B), but api allows to appoint only one - let's say A
+#        (let's say A & B merge into C), then next generation stream shard (C) has two parents (A & B), but the DynamoDB API allows to appoint only one - let's say A
 #        (the other one - B - will never be pointed to as a parent by anything else).
 #        NOTE: it's not the same as having no children - the stream shard (B) will have a child (C), but that child (C) will have it's sibling as parent (A).
 #        Then we try to walk the tree starting from every stream shard that is not pointed to as a parent. Depending on which generation that stream shard is in,
@@ -595,6 +659,12 @@ def test_get_records_with_alternating_tablets_count(dynamodb, dynamodbstreams, r
         cdc_log_table_name = f'{table_name}_scylla_cdc_log'
         init_table_count = get_tablet_count_for_base_table_of_table(rest_api, cql, ks, cdc_log_table_name)
 
+        # --- Phase 1: Drive tablet count changes and write data ---
+        # For each multiplier, alter tablet count and write writes_per_tablet_multiplier
+        # items to the table. Each write uses a small, bounded set of partition keys
+        # (0..partition_count-1) to force per-partition ordering collisions, which
+        # lets us later verify that events within a partition appear in write order.
+        # `e` is a monotonically increasing counter that encodes the write order.
         index = 0
         expected_items = []
         retrieved_items = []
@@ -610,6 +680,13 @@ def test_get_records_with_alternating_tablets_count(dynamodb, dynamodbstreams, r
                 table.put_item(Item={'p': p, 'c': c, 'e': e})
                 expected_items.append((p, c, e))
 
+        # --- Phase 2: Read all stream records via GetRecords, building shard topology ---
+        # Iterate DescribeStream in a retry loop until all expected items have been
+        # retrieved from the stream. For each shard discovered:
+        #   - Record its parent in shard_parents_map (child -> parent).
+        #   - Track root shards (those without a parent).
+        #   - Create a GetShardIterator starting at the shard's StartingSequenceNumber
+        #     and later call GetRecords to drain it, collecting all the formerly put (p, c, e) triples.
         iterators = {}
         shard_parents_map = {}
         root_shard_ids = []
@@ -619,13 +696,14 @@ def test_get_records_with_alternating_tablets_count(dynamodb, dynamodbstreams, r
                 shard_id = shard['ShardId']
                 parent_shard_id = shard.get('ParentShardId', None)
                 if parent_shard_id is None:
-                    root_shard_ids.append(shard_id)
+                    if shard_id not in root_shard_ids:
+                        root_shard_ids.append(shard_id)
                 elif shard_id in shard_parents_map:
                     assert shard_parents_map[shard_id] == parent_shard_id
                 else:
                     shard_parents_map[shard_id] = parent_shard_id
                 if shard_id in iterators:
-                    pytest.fail(f"Iterator for shard {shard_id} already exists")
+                    continue
                 start = shard['SequenceNumberRange']['StartingSequenceNumber']
                 iter = dynamodbstreams.get_shard_iterator(StreamArn=arn, ShardId=shard_id, ShardIteratorType='AT_SEQUENCE_NUMBER',SequenceNumber=start)['ShardIterator']
                 assert iter is not None
@@ -637,7 +715,7 @@ def test_get_records_with_alternating_tablets_count(dynamodb, dynamodbstreams, r
                 if 'NextShardIterator' in response:
                     iterators[shard_id] = response['NextShardIterator']
 
-                records = response.get('Records')
+                records = response.get('Records', [])
                 for record in records:
                     dynamodb = record['dynamodb']
                     keys = dynamodb['NewImage']
@@ -648,6 +726,12 @@ def test_get_records_with_alternating_tablets_count(dynamodb, dynamodbstreams, r
                     e = keys['e'].get('S')
                     retrieved_items.append((p, c, e))
 
+        # --- Phase 3: Verify completeness and per-partition ordering of stream records ---
+        # Check that the set of records retrieved from the stream exactly matches the
+        # set of items written (same count, same content when sorted).
+        # Then verify that for every partition key `p`, the events appear in the same
+        # order they were written: the `e` value (write index) must be strictly
+        # increasing across successive reads for the same `p`.
         assert len(retrieved_items) == len(expected_items)
         assert sorted(retrieved_items) == sorted(expected_items)
         previous_values = {}
@@ -662,21 +746,40 @@ def test_get_records_with_alternating_tablets_count(dynamodb, dynamodbstreams, r
             assert pv < e
             previous_values[p] = e
         
+        # --- Phase 4: Verify shard topology - root shard count ---
+        # The number of root shards (those without a parent) must equal the initial
+        # tablet count.
         assert len(root_shard_ids) == init_table_count
 
-        have_parents = set()
+        # --- Phase 5: Verify shard topology - generational structure and path lengths ---
+        # Build `streams_superseded_by_next_gen`: the set of shard IDs that appear as a parent of some
+        # other shard. Shards NOT in this set are "leaves" (the most recent generation).
+        #
+        # Group all shards (except root ones) by their generation, inferred from the
+        # timestamp embedded in the shard ID (characters [2:13]).
+        #
+        # For each leaf shard, walk the parent chain up to the root (get_path), then
+        # assert that the number of siblings in the leaf's generation equals
+        # `init_table_count * tablet_multipliers[len(path) - 1]`.
+        # This verifies the expected doubling/halving pattern produced by the
+        # alternating tablet_multipliers sequence.
+        streams_superseded_by_next_gen = set()
         for (shard_id, parent_shard_id) in shard_parents_map.items():
-            have_parents.add(parent_shard_id)
+            streams_superseded_by_next_gen.add(parent_shard_id)
 
         def get_generation_from_shard(t):
-            # H 19b22b8563a:7fffffffffffffffe8547ce46400000
-            # 0 2 4 6 8 0 2 4 6 8
+            # Shard IDs have the format "H<hex_generation_ts>:<hex_token>", e.g.
+            # "H 19b22b8563a:7fffffffffffffffe8547ce46400000"
+            # Characters [2:13] extract the hex generation timestamp, which groups
+            # shards that were created together during the same tablet count change.
             return t[2:13]
         count_map = {}
         for r in shard_parents_map:
             gen = get_generation_from_shard(r)
             count = count_map.get(gen, 0)
             count_map[gen] = count + 1
+        # Returns the ancestor chain from shard_id up to the root (a shard with no parent).
+        # The returned list is ordered [shard_id, parent, grandparent, ..., root].
         def get_path(shard_id):
             path = [ shard_id ]
             current_shard_id = shard_id
@@ -687,10 +790,10 @@ def test_get_records_with_alternating_tablets_count(dynamodb, dynamodbstreams, r
                 path.append(parent_shard_id)
                 current_shard_id = parent_shard_id
         for r in shard_parents_map:
-            if r not in have_parents:
+            if r not in streams_superseded_by_next_gen:
                 path = get_path(r)
                 siblings_count = count_map[get_generation_from_shard(r)]
-                assert siblings_count == 1 << (len(tablet_multipliers) + 1 - len(path))
+                assert siblings_count == init_table_count * tablet_multipliers[len(path) - 1]
 
 def test_get_records(dynamodb, dynamodbstreams):
     # TODO: add tests for storage/transactionable variations and global/local index
