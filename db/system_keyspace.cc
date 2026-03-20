@@ -2076,13 +2076,13 @@ future<db_clock::time_point> system_keyspace::read_cdc_for_tablets_current_gener
 // requires QUORUM), this reads from a virtual table backed by local Raft-managed tablet
 // metadata, so consistency_level::ONE is the only meaningful level.
 future<std::map<db_clock::time_point, cdc::streams_version>> system_keyspace::read_cdc_for_tablets_versioned_streams(std::string_view ks_name, std::string_view table_name, db_clock::time_point not_older_than) {
-    static const sstring stream_id_query = format("SELECT stream_id, stream_state, timestamp FROM {}.{} WHERE keyspace_name = ? and table_name = ?", NAME, CDC_STREAMS);
+    static const sstring stream_id_query = format("SELECT stream_id, stream_state, timestamp FROM {}.{} WHERE keyspace_name = ? and table_name = ? AND timestamp >= ?", NAME, CDC_STREAMS);
 
     std::map<db_clock::time_point, utils::chunked_vector<cdc::stream_id>> temp_result;
-    
+
     co_await _qp.query_internal(stream_id_query,
                 db::consistency_level::ONE,
-                data_value_list{ ks_name, table_name },
+                data_value_list{ ks_name, table_name, not_older_than },
                 1000,
                 [&] (const cql3::untyped_result_set_row& row) -> future<stop_iteration> {
         auto stream_state = cdc::read_stream_state(row.get_as<int8_t>("stream_state"));
@@ -2090,11 +2090,6 @@ future<std::map<db_clock::time_point, cdc::streams_version>> system_keyspace::re
             co_return stop_iteration::no;
         }
         auto ts = row.get_as<db_clock::time_point>("timestamp");
-        
-        if (ts < not_older_than) {
-            co_return stop_iteration::no;
-        }
-        
         temp_result[ts].push_back(cdc::stream_id{ row.get_as<bytes>("stream_id") });
         co_return stop_iteration::no;
     });
