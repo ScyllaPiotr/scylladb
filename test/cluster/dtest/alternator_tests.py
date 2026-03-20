@@ -691,7 +691,7 @@ class TesterAlternator(BaseAlternator):
                 random.choice(nodes_for_maintenance).compact()
             except NodetoolError as exc:
                 error_message = str(exc)
-                valid_errors = ["ConnectException", "status code 404 Not Found"]
+                valid_errors = ["ConnectException", "Connection refused", "status code 404 Not Found"]
                 if not any(err in error_message for err in valid_errors):
                     raise
 
