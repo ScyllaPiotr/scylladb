@@ -464,6 +464,18 @@ cdc::options::options(const std::map<sstring, sstring>& map) {
             if (_ttl < 0) {
                 throw exceptions::configuration_exception("Invalid CDC option: ttl must be >= 0");
             }
+        } else if (key == "enable_requested") {
+            if (is_true || is_false) {
+                _enable_requested = is_true;
+            } else {
+                throw exceptions::configuration_exception("Invalid value for CDC option \"enable_requested\": " + p.second);
+            }
+        } else if (key == "tablet_merge_blocked") {
+            if (is_true || is_false) {
+                _tablet_merge_blocked = is_true;
+            } else {
+                throw exceptions::configuration_exception("Invalid value for CDC option \"tablet_merge_blocked\": " + p.second);
+            }
         } else {
             throw exceptions::configuration_exception("Invalid CDC option: " + p.first);
         }
@@ -471,7 +483,7 @@ cdc::options::options(const std::map<sstring, sstring>& map) {
 }
 
 std::map<sstring, sstring> cdc::options::to_map() const {
-    if (!is_enabled_set()) {
+    if (!is_enabled_set() && !_enable_requested) {
         return {};
     }
 
@@ -481,6 +493,8 @@ std::map<sstring, sstring> cdc::options::to_map() const {
         { "postimage", _postimage ? "true" : "false" },
         { "delta", fmt::format("{}", _delta_mode) },
         { "ttl", std::to_string(_ttl) },
+        { "enable_requested", enable_requested() ? "true" : "false" },
+        { "tablet_merge_blocked", _tablet_merge_blocked ? "true" : "false" },
     };
 }
 
@@ -489,7 +503,9 @@ sstring cdc::options::to_sstring() const {
 }
 
 bool cdc::options::operator==(const options& o) const {
-    return enabled() == o.enabled() && _preimage == o._preimage && _postimage == o._postimage && _ttl == o._ttl
+    return enabled() == o.enabled() && enable_requested() == o.enable_requested()
+            && _tablet_merge_blocked == o._tablet_merge_blocked
+            && _preimage == o._preimage && _postimage == o._postimage && _ttl == o._ttl
             && _delta_mode == o._delta_mode;
 }
 

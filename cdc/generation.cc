@@ -16,8 +16,11 @@
 #include "keys/keys.hh"
 #include "replica/database.hh"
 #include "db/system_keyspace.hh"
+#include "db/schema_tables.hh"
 #include "dht/token-sharding.hh"
 #include "locator/token_metadata.hh"
+#include "locator/tablets.hh"
+#include "schema/schema_builder.hh"
 #include "types/set.hh"
 #include "utils/assert.hh"
 #include "utils/error_injection.hh"
@@ -29,6 +32,7 @@
 #include "cdc/cdc_options.hh"
 #include "cdc/generation_service.hh"
 #include "cdc/log.hh"
+#include "service/migration_listener.hh"
 
 extern logging::logger cdc_log;
 
@@ -774,6 +778,63 @@ future<> generation_service::garbage_collect_cdc_streams(utils::chunked_vector<c
             muts.emplace_back(std::move(m));
         }
     }
+}
+
+future<utils::chunked_vector<canonical_mutation>> generation_service::maybe_finalize_pending_stream_enables(const locator::token_metadata& tm, api::timestamp_type ts) {
+    utils::chunked_vector<canonical_mutation> muts;
+
+    if (utils::get_local_injector().enter("delay_cdc_stream_finalization")) {
+        co_return std::move(muts);
+    }
+
+    co_await _db.get_tables_metadata().for_each_table_gently([&] (table_id id, lw_shared_ptr<replica::table> t) -> future<> {
+        auto s = t->schema();
+        if (!s->cdc_options().enable_requested()) {
+            co_return;
+        }
+
+        // Only tablet tables can have enable_requested set
+        if (!tm.tablets().has_tablet_map(id)) {
+            co_return;
+        }
+
+        auto& tmap = tm.tablets().get_tablet_map(id);
+        if (tmap.needs_merge()) {
+            cdc_log.debug("Table {}.{}: deferring stream enablement, tablet merge still in progress", s->ks_name(), s->cf_name());
+            co_return;
+        }
+
+        cdc_log.info("Table {}.{}: finalizing deferred stream enablement (no in-progress merges)", s->ks_name(), s->cf_name());
+
+        // Build a new schema with enabled=true, enable_requested=false
+        schema_builder builder(s);
+        cdc::options new_opts = s->cdc_options();
+        new_opts.enabled(true);
+        new_opts.enable_requested(false);
+        new_opts.tablet_merge_blocked(true);
+        builder.with_cdc_options(new_opts);
+        auto new_schema = builder.build();
+
+        // Generate the schema mutation (table metadata update only, no columns/indices changed)
+        utils::chunked_vector<mutation> schema_muts;
+        db::schema_tables::add_table_or_view_to_schema_mutation(new_schema, ts, false, schema_muts);
+
+        // Trigger the CDC migration listener hook which creates the CDC log table.
+        // This runs on_before_update_column_family listeners (including CDC's own
+        // listener that creates/updates the log table schema).
+        // Must run in seastar::async because before_update_column_family uses
+        // thread_for_each which requires a seastar::thread context (.get() calls).
+        co_await seastar::async([&] {
+            _db.get_notifier().before_update_column_family(*new_schema, *s, schema_muts, ts);
+        });
+
+        for (auto& m : schema_muts) {
+            muts.emplace_back(canonical_mutation(m));
+            co_await coroutine::maybe_yield();
+        }
+    });
+
+    co_return std::move(muts);
 }
 
 } // namespace cdc

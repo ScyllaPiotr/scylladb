@@ -18,6 +18,7 @@ class system_keyspace;
 
 namespace locator {
 class tablet_map;
+class token_metadata;
 }
 
 namespace cdc {
@@ -63,6 +64,12 @@ public:
     future<> query_cdc_streams(table_id table, noncopyable_function<future<>(db_clock::time_point, const utils::chunked_vector<cdc::stream_id>& current, cdc::cdc_stream_diff)> f);
 
     future<> generate_tablet_resize_update(utils::chunked_vector<canonical_mutation>& muts, table_id table, const locator::tablet_map& new_tablet_map, api::timestamp_type ts);
+
+    // Check for tables with enable_requested CDC option and finalize their
+    // stream enablement if no in-progress tablet merges remain.
+    // Returns schema mutations that transition enable_requested -> enabled,
+    // including CDC log table creation side effects.
+    future<utils::chunked_vector<canonical_mutation>> maybe_finalize_pending_stream_enables(const locator::token_metadata& tm, api::timestamp_type ts);
 
     future<utils::chunked_vector<mutation>> garbage_collect_cdc_streams_for_table(table_id table, std::optional<std::chrono::seconds> ttl, api::timestamp_type ts);
     future<> garbage_collect_cdc_streams(utils::chunked_vector<canonical_mutation>& muts, api::timestamp_type ts);

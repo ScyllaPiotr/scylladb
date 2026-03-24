@@ -1649,6 +1649,29 @@ static future<> mark_view_schemas_as_built(utils::chunked_vector<mutation>& out,
     }
 }
 
+// Determine whether a new Alternator table will use tablets, based on the
+// tablets feature flag, the tablets_mode config, and the per-table
+// system:initial_tablets tag. The same decision logic exists (with additional
+// error handling and logging) in create_keyspace_metadata().
+static bool will_use_tablets(const gms::feature_service& feat,
+                             db::tablets_mode_t::mode tablets_mode,
+                             const std::map<sstring, sstring>& tags_map) {
+    if (!feat.tablets) {
+        return false;
+    }
+    auto it = tags_map.find(INITIAL_TABLETS_TAG_KEY);
+    if (it != tags_map.end()) {
+        try {
+            std::stol(it->second);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+    return tablets_mode == db::tablets_mode_t::mode::enabled
+        || tablets_mode == db::tablets_mode_t::mode::enforced;
+}
+
 future<executor::request_return_type> executor::create_table_on_shard0(service::client_state&& client_state, tracing::trace_state_ptr trace_state, rjson::value request, bool enforce_authorization, bool warn_authorization, const db::tablets_mode_t::mode tablets_mode) {
     throwing_assert(this_shard_id() == 0);
 
@@ -1834,13 +1857,6 @@ future<executor::request_return_type> executor::create_table_on_shard0(service::
         }
     }
 
-    rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
-    if (stream_specification && stream_specification->IsObject()) {
-        if (executor::add_stream_options(*stream_specification, builder, _proxy)) {
-            validate_cdc_log_name_length(builder.cf_name());
-        }
-    }
-
     // Parse the "Tags" parameter early, so we can avoid creating the table
     // at all if this parsing failed.
     const rjson::value* tags = rjson::find(request, "Tags");
@@ -1854,6 +1870,15 @@ future<executor::request_return_type> executor::create_table_on_shard0(service::
     }
     set_table_creation_time(tags_map, db_clock::now());
     builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>(tags_map));
+
+    bool uses_tablets = will_use_tablets(_proxy.features(), tablets_mode, tags_map);
+
+    rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
+    if (stream_specification && stream_specification->IsObject()) {
+        if (executor::add_stream_options(*stream_specification, builder, _proxy, !uses_tablets)) {
+            validate_cdc_log_name_length(builder.cf_name());
+        }
+    }
 
     co_await verify_create_permission(enforce_authorization, warn_authorization, client_state, _stats);
 
@@ -2041,17 +2066,22 @@ future<executor::request_return_type> executor::update_table(client_state& clien
             rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
             if (stream_specification && stream_specification->IsObject()) {
                 empty_request = false;
-                if (add_stream_options(*stream_specification, builder, p.local())) {
+                // Check if tablet merges are incompatible with enabling CDC streams.
+                // On tablet tables, merges produce 2 parents per shard which is
+                // incompatible with the DynamoDB Streams API. We tell add_stream_options()
+                // so it can defer enablement until in-progress merges complete.
+                bool uses_tablets = p.local().local_db().find_keyspace(tab->ks_name()).get_replication_strategy().uses_tablets();
+                if (add_stream_options(*stream_specification, builder, p.local(), !uses_tablets)) {
                     validate_cdc_log_name_length(builder.cf_name());
                 }
                 auto stream_enabled = rjson::find(*stream_specification, "StreamEnabled");
                 if (stream_enabled && stream_enabled->IsBool()) {
                     if (stream_enabled->GetBool()) {
-                        if (tab->cdc_options().enabled()) {
+                        if (tab->cdc_options().enabled() || tab->cdc_options().enable_requested()) {
                             co_return api_error::validation("Table already has an enabled stream: TableName: " + tab->cf_name());
                         }
                     }
-                    else if (!tab->cdc_options().enabled()) {
+                    else if (!tab->cdc_options().enabled() && !tab->cdc_options().enable_requested()) {
                         co_return api_error::validation("Table has no stream to disable: TableName: " + tab->cf_name());
                     }
                 }
@@ -6120,6 +6150,8 @@ future<executor::request_return_type> executor::describe_continuous_backups(clie
 // of nodes in the cluster: A cluster with 3 or more live nodes, gets RF=3.
 // A smaller cluster (presumably, a test only), gets RF=1. The user may
 // manually create the keyspace to override this predefined behavior.
+// Note: the boolean tablet decision (initial_tablets.has_value()) must
+// agree with will_use_tablets() above — keep them in sync.
 static lw_shared_ptr<keyspace_metadata> create_keyspace_metadata(std::string_view keyspace_name, service::storage_proxy& sp, gms::gossiper& gossiper, api::timestamp_type ts,
             const std::map<sstring, sstring>& tags_map, const gms::feature_service& feat, const db::tablets_mode_t::mode tablets_mode) {
     // Whether to use tablets for the table (actually for the keyspace of the

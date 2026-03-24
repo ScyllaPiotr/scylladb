@@ -271,7 +271,7 @@ public:
         uint64_t* item_length_in_bytes = nullptr,
         bool = false);
 
-    static bool add_stream_options(const rjson::value& stream_spec, schema_builder&, service::storage_proxy& sp);
+    static bool add_stream_options(const rjson::value& stream_spec, schema_builder&, service::storage_proxy& sp, bool tablet_merge_allowed = true);
     static void supplement_table_info(rjson::value& descr, const schema& schema, service::storage_proxy& sp);
     static void supplement_table_stream_info(rjson::value& descr, const schema& schema, const service::storage_proxy& sp);
 };

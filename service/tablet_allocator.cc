@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "cdc/cdc_options.hh"
 #include "cql3/statements/ks_prop_defs.hh"
 #include "db/system_keyspace.hh"
 #include "locator/tablets.hh"
@@ -2055,6 +2056,22 @@ public:
 
             resize_decision new_resize_decision;
             new_resize_decision.way = table_plan.resize_decision;
+
+            // Block merge decisions for tables with tablet_merge_blocked set
+            // in their CDC options. This is set by Alternator when enabling
+            // streams on tablet tables — tablet merges produce 2 parents per
+            // shard which is incompatible with the DynamoDB Streams API.
+            // If a merge is already in progress on the tmap, suppressing
+            // new_resize_decision here causes the existing revocation logic
+            // in tables_being_resized to cancel it (none != merge).
+            if (new_resize_decision.is_merge()) {
+                auto [s, rs] = get_schema_and_rs(table);
+                if (s->cdc_options().tablet_merge_blocked()) {
+                    lblogger.debug("Table {} ({}.{}): suppressing new merge decision because tablet_merge_blocked is set",
+                                   table, s->ks_name(), s->cf_name());
+                    new_resize_decision = {};
+                }
+            }
 
             table_size_desc size_desc {
                 .avg_tablet_size = *table_plan.avg_tablet_size,

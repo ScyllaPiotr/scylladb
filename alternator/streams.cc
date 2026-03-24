@@ -496,6 +496,8 @@ future<executor::request_return_type> executor::describe_stream(client_state& cl
         } else {
             status = "ENABLED";
         }
+    } else if (opts.enable_requested()) {
+        status = "ENABLING";
     }
 
     auto ttl = std::chrono::seconds(opts.ttl());
@@ -1074,7 +1076,7 @@ future<executor::request_return_type> executor::get_records(client_state& client
     co_return rjson::print(std::move(ret));
 }
 
-bool executor::add_stream_options(const rjson::value& stream_specification, schema_builder& builder, service::storage_proxy& sp) {
+bool executor::add_stream_options(const rjson::value& stream_specification, schema_builder& builder, service::storage_proxy& sp, bool tablet_merge_allowed) {
     auto stream_enabled = rjson::find(stream_specification, "StreamEnabled");
     if (!stream_enabled || !stream_enabled->IsBool()) {
         throw api_error::validation("StreamSpecification needs boolean StreamEnabled");
@@ -1086,7 +1088,6 @@ bool executor::add_stream_options(const rjson::value& stream_specification, sche
         }
 
         cdc::options opts;
-        opts.enabled(true);
         opts.set_delta_mode(cdc::delta_mode::keys);
         opts.ttl(std::chrono::duration_cast<std::chrono::seconds>(dynamodb_streams_max_window).count());
 
@@ -1104,6 +1105,17 @@ bool executor::add_stream_options(const rjson::value& stream_specification, sche
             case stream_view_type::NEW_IMAGE: 
                 opts.postimage(true);
                 break;
+        }
+
+        if (!tablet_merge_allowed) {
+            // Tablet merges are incompatible with CDC streams. Defer actual
+            // enablement until in-progress merges complete. The topology
+            // coordinator will finalize by setting enabled=true once safe.
+            opts.enabled(false);
+            opts.enable_requested(true);
+            opts.tablet_merge_blocked(true);
+        } else {
+            opts.enabled(true);
         }
         builder.with_cdc_options(opts);
         return true;
@@ -1123,21 +1135,23 @@ void executor::supplement_table_stream_info(rjson::value& descr, const schema& s
         stream_arn arn(cf.schema()->id());
         rjson::add(descr, "LatestStreamArn", arn);
         rjson::add(descr, "LatestStreamLabel", rjson::from_string(stream_label(*cf.schema())));
-
-        auto stream_desc = rjson::empty_object();
-        rjson::add(stream_desc, "StreamEnabled", true);
-
-        auto mode = stream_view_type::KEYS_ONLY;
-        if (opts.preimage() && opts.postimage()) {
-            mode = stream_view_type::NEW_AND_OLD_IMAGES;
-        } else if (opts.preimage()) {
-            mode = stream_view_type::OLD_IMAGE;
-        } else if (opts.postimage()) {
-            mode = stream_view_type::NEW_IMAGE;
-        }
-        rjson::add(stream_desc, "StreamViewType", mode);
-        rjson::add(descr, "StreamSpecification", std::move(stream_desc));
+    } else if (!opts.enable_requested()) {
+        return;
     }
+    // For both enabled() and enable_requested():
+    auto stream_desc = rjson::empty_object();
+    rjson::add(stream_desc, "StreamEnabled", true);
+
+    auto mode = stream_view_type::KEYS_ONLY;
+    if (opts.preimage() && opts.postimage()) {
+        mode = stream_view_type::NEW_AND_OLD_IMAGES;
+    } else if (opts.preimage()) {
+        mode = stream_view_type::OLD_IMAGE;
+    } else if (opts.postimage()) {
+        mode = stream_view_type::NEW_IMAGE;
+    }
+    rjson::add(stream_desc, "StreamViewType", mode);
+    rjson::add(descr, "StreamSpecification", std::move(stream_desc));
 }
 
 } // namespace alternator
