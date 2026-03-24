@@ -13,10 +13,11 @@
 # override it. Most of these tests, or perhaps even this entire file,
 # will probably go away eventually.
 
+import time
 import pytest
 from botocore.exceptions import ClientError
 
-from .util import new_test_table, scylla_config_read, scylla_config_temporary
+from .util import new_test_table, create_test_table, scylla_config_read, scylla_config_temporary, scylla_inject_error
 
 # All tests in this file are scylla-only
 @pytest.fixture(scope="function", autouse=True)
@@ -131,25 +132,126 @@ def test_tablets_tag_vs_config(dynamodb):
             with new_test_table(dynamodb, **schema_vnodes) as table:
                 pass
 
-# Before Alternator Streams is supported with tablets (#23838), let's verify
-# that enabling Streams results in an orderly error. This test should be
-# deleted when #23838 is fixed.
-def test_streams_enable_error_with_tablets(dynamodb):
-    # Test attempting to create a table already with streams
-    with pytest.raises(ClientError, match='ValidationException.*tablets'):
-        with new_test_table(dynamodb,
+# Test that enabling Alternator Streams on a tablet table uses deferred
+# enablement: the table goes through an ENABLING state (where the intent
+# is stored but CDC is not yet active) before the topology coordinator
+# finalizes it to ENABLED. While streams are active (ENABLING or ENABLED),
+# tablet merges must be blocked but splits must still be allowed. After
+# streams are disabled, merges must be allowed again.
+#
+# The test exercises an elaborate sequence of tablet count changes:
+# in each of the ENABLING and ENABLED states, first a shrinkage is
+# attempted (must be blocked), then an increase (must succeed). After
+# disabling streams, a shrinkage is attempted (must succeed).
+def test_deferred_stream_enablement_on_tablets(dynamodb, rest_api, cql):
+    def get_table_id(ks, table_name):
+        rows = cql.execute(f"SELECT id FROM system_schema.tables "
+                           f"WHERE keyspace_name='{ks}' AND table_name='{table_name}'")
+        return rows.one().id
+
+    def get_tablet_count(table_id):
+        rows = cql.execute(f"SELECT tablet_count FROM system.tablets "
+                           f"WHERE table_id={table_id} LIMIT 1")
+        return rows.one().tablet_count
+
+    def set_tablet_target(ks, table_name, count):
+        """Set both min and max tablet count to force a specific target."""
+        cql.execute(f'ALTER TABLE "{ks}"."{table_name}" '
+                    f"WITH tablets = {{'min_tablet_count': {count}, 'max_tablet_count': {count}}}")
+
+    def wait_for_tablet_count(table_id, expected_count, timeout=60):
+        """Wait for tablet count to reach exact expected_count."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            count = get_tablet_count(table_id)
+            if count == expected_count:
+                return count
+            time.sleep(0.1)
+        pytest.fail(f"Tablet count did not reach {expected_count} "
+                    f"within {timeout}s (current: {get_tablet_count(table_id)})")
+
+    def assert_tablet_count_stable(table_id, expected_count, duration=5):
+        """Assert tablet count stays at expected_count for duration seconds."""
+        deadline = time.time() + duration
+        while time.time() < deadline:
+            assert get_tablet_count(table_id) == expected_count, \
+                f"Tablet count changed unexpectedly from {expected_count}"
+            time.sleep(0.1)
+
+    # === Phase 1: ENABLING state ===
+    # Hold finalization with an error injection so the table stays in
+    # ENABLING (enable_requested=true, enabled=false) state.
+    with scylla_inject_error(rest_api, "delay_cdc_stream_finalization"):
+        table = create_test_table(dynamodb,
             Tags=[{'Key': initial_tablets_tag, 'Value': '4'}],
             StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'},
-            KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
-            AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
-            pass
-    # Test attempting to add a stream to an existing table
-    with new_test_table(dynamodb,
-        Tags=[{'Key': initial_tablets_tag, 'Value': '4'}],
-        KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
-        AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
-        with pytest.raises(ClientError, match='ValidationException.*tablets'):
-            table.update(StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'});
+            KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'}],
+            AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'S'}])
+        try:
+            # Verify ENABLING state: StreamSpecification is present but
+            # LatestStreamArn is not (CDC log table does not exist yet).
+            desc = table.meta.client.describe_table(TableName=table.name)['Table']
+            assert 'StreamSpecification' in desc
+            assert desc['StreamSpecification']['StreamEnabled'] == True
+            assert desc['StreamSpecification']['StreamViewType'] == 'KEYS_ONLY'
+            assert 'LatestStreamArn' not in desc
+
+            # Double-enable must be rejected while ENABLING.
+            with pytest.raises(ClientError, match='ValidationException.*already has an enabled stream'):
+                table.update(StreamSpecification={
+                    'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'})
+
+            ks = f'alternator_{table.name}'
+            table_id = get_table_id(ks, table.name)
+            count = get_tablet_count(table_id)
+            assert count == 4
+
+            # Shrinkage attempt (ENABLING): must be BLOCKED.
+            # Setting target to 2 would normally trigger a merge (4 -> 2),
+            # but tablet_merge_blocked prevents it.
+            set_tablet_target(ks, table.name, 2)
+            assert_tablet_count_stable(table_id, 4, duration=5)
+
+            # Increase (ENABLING): must succeed (4 -> 8).
+            set_tablet_target(ks, table.name, 8)
+            wait_for_tablet_count(table_id, 8)
+        except:
+            table.delete()
+            raise
+    # <-- delay_cdc_stream_finalization disabled; finalization proceeds.
+
+    # === Phase 2: Transition to ENABLED ===
+    try:
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            desc = table.meta.client.describe_table(TableName=table.name)['Table']
+            if 'LatestStreamArn' in desc:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("Stream did not reach ENABLED state within timeout")
+
+        count = get_tablet_count(table_id)
+        assert count == 8
+
+        # === Phase 3: ENABLED state ===
+        # Shrinkage attempt (ENABLED): must be BLOCKED.
+        set_tablet_target(ks, table.name, 4)
+        assert_tablet_count_stable(table_id, 8, duration=5)
+
+        # Increase (ENABLED): must succeed (8 -> 16).
+        set_tablet_target(ks, table.name, 16)
+        wait_for_tablet_count(table_id, 16)
+
+        # === Phase 4: Disable streams, merges must be unblocked ===
+        table.update(StreamSpecification={'StreamEnabled': False})
+
+        # Shrinkage (streams disabled): must SUCCEED (16 -> 8).
+        set_tablet_target(ks, table.name, 8)
+        wait_for_tablet_count(table_id, 8)
+    finally:
+        table.delete()
+        table.meta.client.get_waiter('table_not_exists').wait(TableName=table.name)
 
 # For a while (see #18068) it was possible to create an Alternator table with
 # tablets enabled and choose LWT for write isolation (always_use_lwt)
