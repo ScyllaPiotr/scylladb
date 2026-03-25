@@ -961,7 +961,7 @@ def test_get_records(dynamodb, dynamodbstreams):
                 if 'NextShardIterator' in response:
                     next_iterators.append(response['NextShardIterator'])
 
-                records = response.get('Records')
+                records = response.get('Records', [])
                 # print("Query {} -> {}".format(iter, records))
                 if records:
                     for record in records:
