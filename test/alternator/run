@@ -79,6 +79,8 @@ def run_alternator_cmd(pid, dir):
         # at the start and then periodically with `tablet-load-stats-refresh-interval-in-seconds`
         # interval, which by default is 60 seconds.
         '--tablet-load-stats-refresh-interval-in-seconds=1',
+        # enforce stable initial tablet count
+        '--tablets-initial-scale-factor=1',
     ]
     if '--https' in sys.argv:
         run.setup_ssl_certificate(dir)
