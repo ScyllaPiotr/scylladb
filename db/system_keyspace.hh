@@ -593,7 +593,7 @@ public:
     // Reads and builds generation map for a given table - a map from generation timestamps to vector of all stream ids for that generation.
     // All cdc generations with timestamp less than `not_older_than` will be ignored.
     // If `not_older_than` is not provided, all generations will be returned.
-    // Returns empty map if table is not found or if there are no generations with timestamp less than `not_older_than`.
+    // Returns empty map if table is not found or if there are no generations with timestamp greater or equal to `not_older_than`.
     // NOTE: there's a sibling `cdc_get_versioned_streams`, that reads the same data for tables backed by legacy vnodes. The data returned is the same.
     future<std::map<db_clock::time_point, cdc::streams_version>> read_cdc_for_tablets_versioned_streams(std::string_view ks_name, std::string_view table_name, db_clock::time_point not_older_than = db_clock::time_point::min());
 
