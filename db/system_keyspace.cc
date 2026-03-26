@@ -2055,7 +2055,7 @@ future<std::unordered_set<dht::token>> system_keyspace::get_local_tokens() {
     });
 }
 
-// Tablet-based counterpart of system_distributed_keyspace::cdc_get_versioned_streams.
+// Tablet-based counterpart of system_distributed_keyspace::cdc_current_generation_timestamp.
 // Unlike the vnode version which reads from a replicated system_distributed table (and thus
 // requires QUORUM), this reads from a virtual table backed by local Raft-managed tablet
 // metadata, so consistency_level::ONE is the only meaningful level.
@@ -2072,7 +2072,7 @@ future<db_clock::time_point> system_keyspace::read_cdc_for_tablets_current_gener
     co_return timestamp_cql->one().get_as<db_clock::time_point>("timestamp");
 }
 
-// Tablet-based counterpart of system_distributed_keyspace::cdc_current_generation_timestamp.
+// Tablet-based counterpart of system_distributed_keyspace::cdc_get_versioned_streams.
 // Unlike the vnode version which reads from a replicated system_distributed table (and thus
 // requires QUORUM), this reads from a virtual table backed by local Raft-managed tablet
 // metadata, so consistency_level::ONE is the only meaningful level.
