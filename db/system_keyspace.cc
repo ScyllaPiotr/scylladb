@@ -2077,7 +2077,9 @@ future<db_clock::time_point> system_keyspace::read_cdc_for_tablets_current_gener
 // requires QUORUM), this reads from a virtual table backed by local Raft-managed tablet
 // metadata, so consistency_level::ONE is the only meaningful level.
 future<std::map<db_clock::time_point, cdc::streams_version>> system_keyspace::read_cdc_for_tablets_versioned_streams(std::string_view ks_name, std::string_view table_name, db_clock::time_point not_older_than) {
-    static const sstring stream_id_query = format("SELECT stream_id, stream_state, timestamp FROM {}.{} WHERE keyspace_name = ? and table_name = ? AND timestamp >= ?", NAME, CDC_STREAMS);
+    // unfortunately we have to read everything and filter in memory, as we always need to have "latest" timestamp available, even
+    // if it's before `not_old_than` timestamp.
+    static const sstring stream_id_query = format("SELECT stream_id, stream_state, timestamp FROM {}.{} WHERE keyspace_name = ? and table_name = ?", NAME, CDC_STREAMS);
 
     std::map<db_clock::time_point, utils::chunked_vector<cdc::stream_id>> temp_result;
     
@@ -2097,7 +2099,9 @@ future<std::map<db_clock::time_point, cdc::streams_version>> system_keyspace::re
     });
 
     std::map<db_clock::time_point, cdc::streams_version> result;
-    for (auto& [ts, streams] : temp_result) {
+    for (auto it = temp_result.lower_bound(not_older_than); it != temp_result.end(); ++it) {
+        auto& ts = it->first;
+        auto& streams = it->second;
         result.insert_or_assign(ts, cdc::streams_version{ std::move(streams), ts });
     }
     co_return std::move(result);
