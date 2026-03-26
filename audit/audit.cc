@@ -126,6 +126,13 @@ static std::map<sstring, std::set<sstring>> parse_audit_tables(const sstring& da
             }
             boost::trim(parts[0]);
             boost::trim(parts[1]);
+            // The real keyspace name of an Alternator table T is
+            // "alternator_T". The audit_tables config flag uses the format
+            // "alternator.T" to refer to such tables, so we expand it here
+            // to the real keyspace name.
+            if (parts[0] == "alternator") {
+                parts[0] = "alternator_" + parts[1];
+            }
             result[parts[0]].insert(std::move(parts[1]));
         }
     }

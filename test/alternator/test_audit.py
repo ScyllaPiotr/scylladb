@@ -174,8 +174,8 @@ def _strip_config_quotes(val):
 # After the test, the previous audit settings are restored.
 @pytest.fixture(scope="function")
 def alternator_audit_enabled(cql):
-    # Store current values of "audit_categories", "audit_keyspaces" in the system.config table
-    names = ("audit_categories", "audit_keyspaces")
+    # Store current values of audit config keys in the system.config table
+    names = ("audit_categories", "audit_keyspaces", "audit_tables")
     names_in_clause = ", ".join(f"'{n}'" for n in names)
     rows = cql.execute(f"SELECT name, value FROM system.config WHERE name IN ({names_in_clause})")
     original_config_vals = {row.name: row.value for row in rows}
@@ -667,3 +667,30 @@ def test_audit_empty_keyspace_bypass(dynamodb, cql, alternator_audit_enabled):
         _assert_no_audit_entries_for(new_rows, ks_name=ks_name)
         with pytest.raises(AssertionError):
             _assert_no_audit_entries_for(new_rows, ks_name="")  # sanity check
+
+
+# Test the audit_tables=alternator.<table> shorthand. When the user configures
+# audit_tables=alternator.<table_a>, the parser expands this to the internal
+# keyspace name alternator_<table_a> with table <table_a>. Only operations on
+# table_a should be audited; operations on table_b should NOT appear.
+def test_audit_tables_filtering(dynamodb, cql, alternator_audit_enabled):
+    with new_test_table(dynamodb, **HASH_ONLY_SCHEMA) as table_a:
+        with new_test_table(dynamodb, **HASH_ONLY_SCHEMA) as table_b:
+            ks_a = f"alternator_{table_a.name}"
+            ks_b = f"alternator_{table_b.name}"
+            # Use the alternator.<table> shorthand in audit_tables.
+            cql.execute("UPDATE system.config SET value=%s WHERE name='audit_tables'",
+                        (f"alternator.{table_a.name}",))
+            # Clear audit_keyspaces so it doesn't interfere with the test.
+            cql.execute("UPDATE system.config SET value=%s WHERE name='audit_keyspaces'", ("",))
+            before_rows = _get_audit_log_rows(cql)
+            # Negative: PutItem on table_b — should NOT be logged.
+            table_b.put_item(Item={"p": "pk_b"})
+            # Positive canary: PutItem on table_a — should be logged.
+            table_a.put_item(Item={"p": "pk_a"})
+            expected = [("DML", "LOCAL_QUORUM", False, ks_a, table_a.name, ["PutItem", "pk_a"])]
+            new_rows = _get_new_audit_log_rows(cql, before_rows, expected_new_row_count=1)
+            _assert_audit_entries(new_rows, expected, ks_a, table_a.name)
+            _assert_no_audit_entries_for(new_rows, ks_name=ks_b)
+            with pytest.raises(AssertionError):
+                _assert_no_audit_entries_for(new_rows, ks_name=ks_a)  # sanity check
