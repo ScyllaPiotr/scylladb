@@ -588,6 +588,7 @@ public:
 
     // Reads current generation timestamp for the given table. Throws runtime_error (see `cql3::untyped_result_set::one()`) if table not found.
     // NOTE: there's a sibling `cdc_current_generation_timestamp` in `system_distributed_keyspace`, that does the same for tables backed up by vnodes.
+    // NOTE: currently used only by alternator
     future<db_clock::time_point> read_cdc_for_tablets_current_generation_timestamp(std::string_view ks_name, std::string_view table_name);
 
     // Reads and builds generation map for a given table - a map from generation timestamps to vector of all stream ids for that generation.
@@ -595,6 +596,7 @@ public:
     // If `not_older_than` is not provided, all generations will be returned.
     // Returns empty map if table is not found or if there are no generations with timestamp greater or equal to `not_older_than`.
     // NOTE: there's a sibling `cdc_get_versioned_streams`, that reads the same data for tables backed by legacy vnodes. The data returned is the same.
+    // NOTE: currently used only by alternator
     future<std::map<db_clock::time_point, cdc::streams_version>> read_cdc_for_tablets_versioned_streams(std::string_view ks_name, std::string_view table_name, db_clock::time_point not_older_than = db_clock::time_point::min());
 
     // Load Raft Group 0 id from scylla.local
