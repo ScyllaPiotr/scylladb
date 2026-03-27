@@ -2085,7 +2085,7 @@ future<std::map<db_clock::time_point, cdc::streams_version>> system_keyspace::re
     
     co_await _qp.query_internal(stream_id_query,
                 db::consistency_level::ONE,
-                data_value_list{ ks_name, table_name, not_older_than },
+                data_value_list{ ks_name, table_name },
                 1000,
                 [&] (const cql3::untyped_result_set_row& row) -> future<stop_iteration> {
         auto stream_state = cdc::read_stream_state(row.get_as<int8_t>("stream_state"));
