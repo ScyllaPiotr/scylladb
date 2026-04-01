@@ -25,6 +25,8 @@ applyTo: "**/*.{cc,hh}"
 - Use `seastar::gate` for shutdown coordination
 - Use `seastar::semaphore` for resource limiting (not `std::mutex`)
 - Break long loops with `maybe_yield()` to avoid reactor stalls
+- Most Scylla code runs on a single shard where atomics are unnecessary
+- Use Seastar message passing for cross-shard communication
 
 ## Coroutines
 ```cpp
@@ -36,9 +38,15 @@ seastar::future<T> func() {
 
 ## Error Handling
 - Throw exceptions for errors (futures propagate them automatically)
+- In coroutines, use `co_await coroutine::return_exception_ptr()` or `co_return coroutine::exception()` to avoid the overhead of throwing
 - In data path: avoid exceptions, use `std::expected` (or `boost::outcome`) instead
 - Use standard exceptions (`std::runtime_error`, `std::invalid_argument`)
 - Database-specific: throw appropriate schema/query exceptions
+
+## Invariant Checking
+- Prefer `throwing_assert()` (`utils/assert.hh`), it logs and throws instead of aborting
+- Use `SCYLLA_ASSERT` where critical to system stability where no clean shutdown is possible, it aborts
+- Use `on_internal_error()` for should-never-happen conditions that should be logged with backtrace
 
 ## Performance
 - Pass large objects by `const&` or `&&` (move semantics)
@@ -68,7 +76,7 @@ seastar::future<T> func() {
 - Use `#pragma once`
 - Include order: own header, C++ std, Seastar, Boost, project headers
 - Forward declare when possible
-- Never `using namespace` in headers (exception: `using namespace seastar` is globally available via `seastarx.hh`)
+- Never `using namespace` in headers. Exception: most headers include `seastarx.hh`, which provides `using namespace seastar` project-wide.
 
 ## Documentation
 - Public APIs require clear documentation
@@ -101,10 +109,8 @@ seastar::future<T> func() {
 - `malloc`/`free`
 - `printf` family (use logging or fmt)
 - Raw pointers for ownership
-- `using namespace` in headers
 - Blocking operations: `std::sleep`, `std::read`, `std::mutex` (use Seastar equivalents)
-- `std::atomic` (reserved for very special circumstances only)
-- Macros (use `inline`, `constexpr`, or templates instead)
+- New ad-hoc macros (prefer `inline`, `constexpr`, or templates; established project macros like `SCYLLA_ASSERT` are fine)
 
 ## Testing
 When modifying existing code, follow TDD: create/update test first, then implement.

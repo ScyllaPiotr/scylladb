@@ -5,13 +5,14 @@ High-performance distributed NoSQL database. Core values: performance, correctne
 
 ## Build System
 
-### Modern Build (configure.py + ninja)
+### Using native OS environment
 ```bash
-# Configure (run once per mode, or when switching modes)
-./configure.py --mode=<mode>  # mode: dev, debug, release, sanitize
+# Configure (run once)
+./configure.py
 
 # Build everything
-ninja <mode>-build  # e.g., ninja dev-build
+ninja <mode>-build  # modes: dev, debug, release, sanitize
+                    # dev is recommended for development (fastest compilation)
 
 # Build Scylla binary only (sufficient for Python integration tests)
 ninja build/<mode>/scylla
@@ -19,6 +20,9 @@ ninja build/<mode>/scylla
 # Build specific test
 ninja build/<mode>/test/boost/<test_name>
 ```
+
+### Using frozen toolchain (Docker)
+Prefix any build command with `./tools/toolchain/dbuild`.
 
 ## Running Tests
 
@@ -36,9 +40,9 @@ ninja build/<mode>/test/boost/<test_name>
 ```
 
 **Important:** 
-- Use full path with `.cc` extension (e.g., `test/boost/test_name.cc`, not `boost/test_name`)
+- Use full path with `.cc` extension (e.g., `test/boost/memtable_test.cc`)
 - To run a single test case, append `::<test_case_name>` to the file path
-- If you encounter permission issues with cgroup metric gathering, add `--no-gather-metrics` flag
+- If you encounter permission issues with cgroup metrics, add `--no-gather-metrics` to the `./test.py` command
 
 **Rebuilding Tests:**
 - test.py does NOT automatically rebuild when test source files are modified
@@ -60,25 +64,21 @@ ninja build/<mode>/scylla
 # Run a single test case from a file
 ./test.py --mode=<mode> test/<suite>/<test_name>.py::<test_function_name>
 
-# Run all tests in a directory
-./test.py --mode=<mode> test/<suite>/
-
 # Examples
 ./test.py --mode=dev test/alternator/
-./test.py --mode=dev test/cluster/test_raft_voters.py::test_raft_limited_voters_retain_coordinator
 ./test.py --mode=dev test/cqlpy/test_json.py
+./test.py --mode=dev test/cluster/test_raft_voters.py::test_raft_limited_voters_retain_coordinator
 
 # Optional flags
-./test.py --mode=dev test/cluster/test_raft_no_quorum.py -v  # Verbose output
-./test.py --mode=dev test/cluster/test_raft_no_quorum.py --repeat 5  # Repeat test 5 times
+./test.py --mode=dev test/cluster/test_raft_no_quorum.py -v --repeat 5
 ```
 
 **Important:**
-- Use full path with `.py` extension (e.g., `test/cluster/test_raft_no_quorum.py`, not `cluster/test_raft_no_quorum`)
+- Use full path with `.py` extension
 - To run a single test case, append `::<test_function_name>` to the file path
 - Add `-v` for verbose output
 - Add `--repeat <num>` to repeat a test multiple times
-- After modifying C++ source files, only rebuild the Scylla binary for Python tests - building the entire repository is unnecessary
+- After modifying C++ source files, only rebuild the Scylla binary for Python tests
 
 ## Code Philosophy
 - Performance matters in hot paths (data read/write, inner loops)
@@ -92,10 +92,13 @@ ninja build/<mode>/scylla
 ## Test Philosophy
 - Performance matters. Tests should run as quickly as possible. Sleeps in the code are highly discouraged and should be avoided, to reduce run time and flakiness.
 - Stability matters. Tests should be stable. New tests should be executed 100 times at least to ensure they pass 100 out of 100 times. (use --repeat 100 --max-failures 1 when running it)
-- Unit tests should ideally test one thing and one thing only.
+- Unit tests should ideally test one thing only.
 - Tests for bug fixes should run before the fix - and show the failure and after the fix - and show they now pass.
 - Tests for bug fixes should have in their comments which bug fixes (GitHub or JIRA issue) they test.
 - Tests in debug are always slower, so if needed, reduce number of iterations, rows, data used, cycles, etc. in debug mode.
 - Tests should strive to be repeatable, and not use random input that will make their results unpredictable.
 - Tests should consume as little resources as possible. Prefer running tests on a single node if it is sufficient, for example.
 
+## New Files
+- Include `LicenseRef-ScyllaDB-Source-Available-1.1` in the SPDX header
+- Use the current year for new files; for existing code keep the year as is

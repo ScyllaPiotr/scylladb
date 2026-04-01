@@ -7,7 +7,7 @@ applyTo: "**/*.py"
 **Important:** Match existing code style. Some directories (like `test/cqlpy` and `test/alternator`) prefer simplicity over type hints and docstrings.
 
 ## Style
-- Follow PEP 8
+- Match style of the file and directory you are editing; fall back to PEP 8 if unclear
 - Use type hints for function signatures (unless directory style omits them)
 - Use f-strings for formatting
 - Line length: 160 characters max
@@ -25,7 +25,7 @@ from cassandra.cluster import Cluster
 from test.utils import setup_keyspace
 ```
 
-Never use `from module import *`
+Avoid wildcard imports (`from module import *`).
 
 ## Documentation
 All public functions/classes need docstrings (unless the current directory conventions omit them):
