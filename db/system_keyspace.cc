@@ -2078,7 +2078,7 @@ future<db_clock::time_point> system_keyspace::read_cdc_for_tablets_current_gener
 // metadata, so consistency_level::ONE is the only meaningful level.
 future<std::map<db_clock::time_point, cdc::streams_version>> system_keyspace::read_cdc_for_tablets_versioned_streams(std::string_view ks_name, std::string_view table_name, db_clock::time_point not_older_than) {
     // unfortunately we have to read everything and filter in memory, as we always need to have "latest" timestamp available, even
-    // if it's before `not_old_than` timestamp.
+    // if it's before `not_older_than` timestamp.
     static const sstring stream_id_query = format("SELECT stream_id, stream_state, timestamp FROM {}.{} WHERE keyspace_name = ? and table_name = ?", NAME, CDC_STREAMS);
 
     std::map<db_clock::time_point, utils::chunked_vector<cdc::stream_id>> temp_result;
