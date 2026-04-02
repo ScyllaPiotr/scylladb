@@ -14,6 +14,7 @@
 #include <ranges>
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/on_internal_error.hh>
@@ -2097,6 +2098,7 @@ future<std::map<db_clock::time_point, cdc::streams_version>> system_keyspace::re
         auto ts = row.get_as<db_clock::time_point>("timestamp");
 
         temp_result[ts].push_back(cdc::stream_id{ row.get_as<bytes>("stream_id") });
+        co_await coroutine::maybe_yield();
         co_return stop_iteration::no;
     });
 
