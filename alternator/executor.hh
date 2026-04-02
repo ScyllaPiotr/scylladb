@@ -145,7 +145,7 @@ class executor : public peering_sharded_service<executor> {
     service::storage_proxy& _proxy;
     service::migration_manager& _mm;
     db::system_distributed_keyspace& _sdks;
-    db::system_keyspace &_system_keyspace;
+    db::system_keyspace& _system_keyspace;
     cdc::metadata& _cdc_metadata;
     utils::updateable_value<bool> _enforce_authorization;
     utils::updateable_value<bool> _warn_authorization;
