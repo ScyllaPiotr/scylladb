@@ -2099,7 +2099,13 @@ future<std::map<db_clock::time_point, cdc::streams_version>> system_keyspace::re
     });
 
     std::map<db_clock::time_point, cdc::streams_version> result;
-    for (auto it = temp_result.lower_bound(not_older_than); it != temp_result.end(); ++it) {
+    // Include the generation that straddles the boundary, matching the vnode
+    // counterpart (cdc_get_versioned_streams) which does the same adjustment.
+    auto it = temp_result.lower_bound(not_older_than);
+    if (it != temp_result.begin()) {
+        --it;
+    }
+    for (; it != temp_result.end(); ++it) {
         auto& ts = it->first;
         auto& streams = it->second;
         result.insert_or_assign(ts, cdc::streams_version{ std::move(streams), ts });
