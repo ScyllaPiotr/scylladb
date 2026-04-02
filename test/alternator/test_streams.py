@@ -22,12 +22,14 @@ TAGS = []
 # To avoid relying on semantics of a similar fixture used in TTL tests, we define it locally here instead of reusing
 # that fixture, and we do not import or reuse fixtures across modules.
 # It sets the TAGS variable in the module’s global namespace to the current parameter value before each test.
-# All tests will be run with both values.
+# All tests will be run with both values. On AWS the parameterization is meaningless, so we skip the second variant.
 @pytest.fixture(params=[
     [{'Key': 'system:initial_tablets', 'Value': 'none'}],
     [{'Key': 'system:initial_tablets', 'Value': '0'}],
 ], ids=["using vnodes", "using tablets"], autouse=True)
-def tags_param(request):
+def tags_param(request, dynamodb):
+    if is_aws(dynamodb) and request.param[0].get('Value') != 'none':
+        pytest.skip('vnodes/tablets parameterization not applicable on AWS')
     # Set TAGS in the global namespace of this module
     global TAGS
     TAGS = request.param
