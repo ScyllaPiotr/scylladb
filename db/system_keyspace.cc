@@ -2082,7 +2082,7 @@ future<std::map<db_clock::time_point, cdc::streams_version>> system_keyspace::re
     static const sstring stream_id_query = format("SELECT stream_id, stream_state, timestamp FROM {}.{} WHERE keyspace_name = ? and table_name = ?", NAME, CDC_STREAMS);
 
     std::map<db_clock::time_point, utils::chunked_vector<cdc::stream_id>> temp_result;
-    
+
     co_await _qp.query_internal(stream_id_query,
                 db::consistency_level::ONE,
                 data_value_list{ ks_name, table_name },
@@ -2093,7 +2093,7 @@ future<std::map<db_clock::time_point, cdc::streams_version>> system_keyspace::re
             co_return stop_iteration::no;
         }
         auto ts = row.get_as<db_clock::time_point>("timestamp");
-        
+
         temp_result[ts].push_back(cdc::stream_id{ row.get_as<bytes>("stream_id") });
         co_return stop_iteration::no;
     });
