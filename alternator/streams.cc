@@ -522,7 +522,10 @@ future<executor::request_return_type> executor::describe_stream(client_state& cl
 
     // filter out cdc generations older than the table or now() - cdc::ttl (typically dynamodb_streams_max_window - 24h)
     if (schema->table().uses_tablets()) {
-        // we can't use table creation time here, as tablets might report timestamp just before table creation
+        // We can't use table creation time here, as tablets might report a
+        // generation timestamp just before table creation. This is safe
+        // because CDC generations are per-table and cannot pre-date the
+        // table, so expanding the window won't pull in unrelated data.
         auto low_ts = db_clock::now() - ttl;
         topologies = co_await _system_keyspace.read_cdc_for_tablets_versioned_streams(bs->ks_name(), bs->cf_name(), low_ts);
     } else {
