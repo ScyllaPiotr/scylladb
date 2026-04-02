@@ -244,7 +244,7 @@ def test_parent_children_split(dynamodb, dynamodbstreams, rest_api, cql):
         for children in shard_children_map.values():
             for child in children:
                 all_children.append(child)
-        assert len(set(shard_children_map.values())) == len(shard_children_map.values())
+        assert len(set(all_children)) == len(all_children)
 
     run_parent_children_relationship_test(dynamodb, dynamodbstreams, rest_api, cql, [2], verify_parent_children_relationship_split)
 
