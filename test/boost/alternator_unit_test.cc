@@ -15,6 +15,7 @@
 #include "alternator/serialization.hh"
 
 #include "cdc/generation.hh"
+#include "dht/token-sharding.hh"
 #include "alternator/expressions.hh"
 #include "alternator/streams.hh"
 #include <seastar/core/coroutine.hh>
@@ -476,6 +477,14 @@ BOOST_AUTO_TEST_CASE(find_parent_shard_in_previous_generation_one_value) {
 namespace {
     auto sid(std::int64_t token) {
         return cdc::stream_id{ dht::token{ token }, 0 };
+    }
+    auto stream_ids(std::initializer_list<cdc::stream_id> ids) {
+        utils::chunked_vector<cdc::stream_id> result;
+        result.reserve(ids.size());
+        for (const auto& id : ids) {
+            result.push_back(id);
+        }
+        return result;
     }
     auto sids(std::initializer_list<std::int64_t> tokens) {
         utils::chunked_vector<cdc::stream_id> result;
@@ -1016,6 +1025,63 @@ BOOST_AUTO_TEST_CASE(test_find_children_range_from_parent_vnodes_split_3) {
 
     range = to_sids(alternator::find_children_range_from_parent_token(parent_streams, current_streams, parent_streams[2], false));
     BOOST_REQUIRE(vec(range) == sorted_vec(current_streams, 2, 4));
+}
+
+// This test exercises a known bug: when multiple current-generation stream ids
+// share the same token (which legitimately happens in CDC generation for small
+// vnodes), find_children_range_from_parent_token only returns one of them
+// instead of all.
+//
+// Setup: a static_sharder with 3 shards and ignore_msb=0 (one contiguous
+// shard-pattern repetition across the ring).  We pick the tiny vnode at the
+// very end of the ring — range (max-1, max] — which is so small that only
+// shard 2 actually owns the single token inside it (last_token() maps to
+// shard 2).  For shards 0 and 1, find_first_token_for_shard finds no token
+// in the range and falls back to the vnode-end token (last_token()).  This is
+// the standard CDC behaviour for shard slots without a token in a small vnode:
+// their representative stream id uses the vnode end token.  The result is
+// three distinct stream ids that all share the same token, which is exactly
+// the scenario that triggers the bug.
+BOOST_AUTO_TEST_CASE(test_find_children_range_from_parent_vnodes_duplicate_end_token_realistic,
+        *boost::unit_test::expected_failures(1)) {
+
+    auto prev_token = [] (dht::token t) {
+        return dht::token::from_int64(dht::token::to_int64(t) - 1);
+    };
+
+    dht::static_sharder sharder(3, 0); // 3 shards, ignore_msb=0 → single shard-pattern repetition
+    auto end = dht::last_token();
+    auto start = prev_token(end);
+    auto current_streams = stream_ids({
+        cdc::stream_id(dht::find_first_token_for_shard(sharder, start, end, 0), 7),
+        cdc::stream_id(dht::find_first_token_for_shard(sharder, start, end, 1), 7),
+        cdc::stream_id(dht::find_first_token_for_shard(sharder, start, end, 2), 7),
+    });
+
+    BOOST_REQUIRE(current_streams.size() == 3);
+    BOOST_REQUIRE_EQUAL(current_streams[0].token(), end);
+    BOOST_REQUIRE_EQUAL(current_streams[1].token(), end);
+    BOOST_REQUIRE_EQUAL(current_streams[2].token(), end);
+
+    auto parent_streams = sids({ 0, std::numeric_limits<std::int64_t>::max() });
+
+    // CHILD_SHARDS orders equal-token children by full stream id, so sort the
+    // expected result the same way before comparing.
+    auto expected = current_streams;
+    std::sort(expected.begin(), expected.end(), [](const cdc::stream_id& a, const cdc::stream_id& b) {
+        return compare_unsigned(a.to_bytes(), b.to_bytes()) < 0;
+    });
+
+    auto got = to_sids(alternator::find_children_range_from_parent_token(
+            parent_streams,
+            current_streams,
+            parent_streams[1],
+            false));
+
+    BOOST_REQUIRE_MESSAGE(
+            got == expected,
+            format("The parent shard should include all {} current shard streams for this one-token vnode, but the selection returned only {} of them.",
+                    expected.size(), got.size()));
 }
 
 BOOST_AUTO_TEST_CASE(test_find_children_range_from_parent_vnodes_split_4) {
