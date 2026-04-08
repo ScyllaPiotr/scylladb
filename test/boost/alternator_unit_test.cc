@@ -1027,10 +1027,12 @@ BOOST_AUTO_TEST_CASE(test_find_children_range_from_parent_vnodes_split_3) {
     BOOST_REQUIRE(vec(range) == sorted_vec(current_streams, 2, 4));
 }
 
-// This test exercises a known bug: when multiple current-generation stream ids
-// share the same token (which legitimately happens in CDC generation for small
-// vnodes), find_children_range_from_parent_token only returns one of them
-// instead of all.
+// Regression test for duplicate-token CHILD_SHARDS selection.
+//
+// Multiple current-generation stream ids can legitimately share the same token
+// in CDC generation for small vnodes.  This test verifies that
+// find_children_range_from_parent_token returns all such children rather than
+// collapsing them to one.
 //
 // Setup: a static_sharder with 3 shards and ignore_msb=0 (one contiguous
 // shard-pattern repetition across the ring).  We pick the tiny vnode at the
@@ -1041,9 +1043,8 @@ BOOST_AUTO_TEST_CASE(test_find_children_range_from_parent_vnodes_split_3) {
 // the standard CDC behaviour for shard slots without a token in a small vnode:
 // their representative stream id uses the vnode end token.  The result is
 // three distinct stream ids that all share the same token, which is exactly
-// the scenario that triggers the bug.
-BOOST_AUTO_TEST_CASE(test_find_children_range_from_parent_vnodes_duplicate_end_token_realistic,
-        *boost::unit_test::expected_failures(1)) {
+// the scenario this regression test covers.
+BOOST_AUTO_TEST_CASE(test_find_children_range_from_parent_vnodes_duplicate_end_token_realistic) {
 
     auto prev_token = [] (dht::token t) {
         return dht::token::from_int64(dht::token::to_int64(t) - 1);

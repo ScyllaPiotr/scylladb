@@ -600,8 +600,11 @@ stream_id_range find_children_range_from_parent_token(
     std::sort(current_streams.begin(), current_streams.end(), compare_by_token);
 
     utils::chunked_vector<cdc::stream_id>::iterator child_shard_begin_it;
-    auto child_shard_end_it = std::lower_bound(current_streams.begin(), current_streams.end(), parent_shard_end_it->token(), [](const cdc::stream_id& id, const dht::token& t) {
-            return id.token() < t;
+    // upper_bound gives us the first element with token strictly greater than
+    // parent's end token - this is the correct one-past-end for an inclusive
+    // boundary and handles duplicate tokens (multiple children sharing a token)
+    auto child_shard_end_it = std::upper_bound(current_streams.begin(), current_streams.end(), parent_shard_end_it->token(), [](const dht::token& t, const cdc::stream_id& id) {
+            return t < id.token();
     });
 
     if (uses_tablets) {
@@ -619,18 +622,15 @@ stream_id_range find_children_range_from_parent_token(
         // first we find token in P that is end of range of parent - parent_shard_end_it
         // - if parent_shard_end_it - 1 exists
         //   - we take it as parent_shard_begin_it
-        //   - find lower or equal token in C to parent_shard_begin_it, set it to child_shard_begin_it
-        //      - if child_shard_begin_it->token() == parent_shard_begin_it->token() then increment child_shard_begin_it
-        //      child_shard_begin_it now points at first child with token > parent_shard_begin_it->token()
+        //   - find the first child with token > parent_shard_begin_it and set it to child_shard_begin_it
         // - else previous one to parent_shard_end_it does not exist
         //   - set child_shard_begin_it = C.begin()
-        // - find lower or equal token in C to parent_shard_end_it, set it to child_shard_end_it, increment once
-        //      child_shard_end_it now points at first child with token > parent_shard_end_it
+        // - find the first child with token > parent_shard_end_it and set it to child_shard_end_it
         // - range [child_shard_begin_it, child_shard_end_it) represents children
 
-        if (child_shard_end_it == current_streams.end()) {
-            // last token is not present, we bail out early with an internal error
-            on_internal_error(slogger, fmt::format("last token from token space not present in tokens, for parent shard id {}, got parent shards [{}] and children shards [{}]",
+        if (child_shard_end_it == current_streams.begin() || std::prev(child_shard_end_it)->token() != parent_shard_end_it->token()) {
+            // parent's end token is not present in children - this should not happen for tablets
+            on_internal_error(slogger, fmt::format("parent end token not present in children tokens, for parent shard id {}, got parent shards [{}] and children shards [{}]",
                 parent, fmt::join(parent_streams, "; "), fmt::join(current_streams, "; ")));
         }
 
@@ -640,22 +640,12 @@ stream_id_range find_children_range_from_parent_token(
             child_shard_begin_it = current_streams.begin();
         } else {
             // normal case - we have previous parent Streams shard that determines beginning of the range (exclusive)
+            // upper_bound skips past all children at the previous parent's token (including duplicates)
             auto parent_shard_begin_it = std::prev(parent_shard_end_it);
-            child_shard_begin_it = std::lower_bound(current_streams.begin(), current_streams.end(), parent_shard_begin_it->token(), [](const cdc::stream_id& id, const dht::token& t) {
-                return id.token() < t;
+            child_shard_begin_it = std::upper_bound(current_streams.begin(), current_streams.end(), parent_shard_begin_it->token(), [](const dht::token& t, const cdc::stream_id& id) {
+                return t < id.token();
             });
-            // sanity check - child_shard_begin_it must not be end() - last token must be present
-            if (child_shard_begin_it == current_streams.end()) {
-                on_internal_error(slogger, fmt::format("last token from token space not present in tokens, for shard id {}, parent shard id {}, got parent shards [{}] and children shards [{}]",
-                    parent, *parent_shard_begin_it, fmt::join(parent_streams, "; "), fmt::join(current_streams, "; ")));
-            }
-            // we have found beginning of the children stream, but since it's exclusive, we need to increment it if it's exact match
-            if (child_shard_begin_it->token() == parent_shard_begin_it->token()) {
-                ++child_shard_begin_it;
-            }
         }
-        // last match is inclusive - so we need to increment end
-        ++child_shard_end_it;
 
         // simple range
         return stream_id_range{ current_streams, child_shard_begin_it, child_shard_end_it };
@@ -682,14 +672,13 @@ stream_id_range find_children_range_from_parent_token(
                 // end of the range
                 res_end = current_streams.end();
             } else {
-                auto it = std::lower_bound(current_streams.begin(), current_streams.end(), (*end)->token(), [](const cdc::stream_id& id, const dht::token& t) {
-                    return id.token() < t;
+                // end of the range is inclusive, so we use upper_bound to find the first element
+                // with token strictly greater than the end token - this correctly handles the case
+                // where multiple children share the same token (e.g. small vnodes where several
+                // shards fall back to the vnode-end token)
+                res_end = std::upper_bound(current_streams.begin(), current_streams.end(), (*end)->token(), [](const dht::token& t, const cdc::stream_id& id) {
+                    return t < id.token();
                 });
-                // end of the range is inclusive, so increment once
-                if (it != current_streams.end()) {
-                    ++it;
-                }
-                res_end = it;
             }
             return { res_lo, res_end };
         };
@@ -745,9 +734,14 @@ stream_id_range find_children_range_from_parent_token(
             // note, that searching for 0 parent will give correct result, but because algorithm in that case
             // detects wrap around case and chooses different if
             if (parent_shard_end_it->token() > current_streams.back().token() && lo1 != current_streams.begin()) {
-                // wrap around case - we need to add first current element as well
-                end2 = lo2 = current_streams.begin();
-                ++end2;
+                // wrap around case - children at the beginning of the sorted array
+                // wrap around the ring and cover the parent's range.  Include all
+                // children sharing the first token (duplicate tokens are possible
+                // for small vnodes where multiple shards fall back to the same token)
+                lo2 = current_streams.begin();
+                end2 = std::upper_bound(current_streams.begin(), current_streams.end(), current_streams.begin()->token(), [](const dht::token& t, const cdc::stream_id& id) {
+                    return t < id.token();
+                });
                 std::swap(lo1, lo2);
                 std::swap(end1, end2);
             }
