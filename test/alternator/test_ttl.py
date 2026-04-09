@@ -849,3 +849,41 @@ def test_ttl_tag_is_unwritable(test_table, scylla_only):
         client.tag_resource(ResourceArn=arn, Tags=[{'Key': tag_name, 'Value': 'x'}])
     with pytest.raises(ClientError, match='ValidationException.*internal'):
         client.untag_resource(ResourceArn=arn, TagKeys=[tag_name])
+
+# Per-row TTL is not compatible with TimeWindowCompactionStrategy (TWCS).
+# TWCS never compacts across windows, so tombstones produced by per-row TTL
+# expirations in a new window will never remove the shadowed data in an old
+# window. The following two tests verify that the combination is rejected
+# from both directions via the Alternator and CQL APIs.
+# Reproduces scylladb/scylladb#19805.
+
+# Test that UpdateTimeToLive is rejected on a table whose compaction
+# strategy was changed to TWCS via CQL.
+def test_ttl_enable_on_twcs_table(dynamodb, cql, scylla_only):
+    with new_test_table(dynamodb,
+        Tags=TAGS,
+        KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }],
+        AttributeDefinitions=[{ 'AttributeName': 'p', 'AttributeType': 'S' }]
+        ) as table:
+            ks = 'alternator_' + table.name
+            cql.execute(f"ALTER TABLE \"{ks}\".\"{table.name}\" WITH "
+                        f"compaction = {{'class': 'TimeWindowCompactionStrategy'}}")
+            with pytest.raises(ClientError, match='ValidationException.*not compatible'):
+                table.meta.client.update_time_to_live(TableName=table.name,
+                    TimeToLiveSpecification={'AttributeName': 'expiration', 'Enabled': True})
+
+# Test that ALTER TABLE to TWCS via CQL is rejected on a table that has
+# Alternator TTL enabled.
+def test_twcs_on_ttl_enabled_table(dynamodb, cql, scylla_only):
+    from cassandra.protocol import ConfigurationException as CqlConfigurationException
+    with new_test_table(dynamodb,
+        Tags=TAGS,
+        KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }],
+        AttributeDefinitions=[{ 'AttributeName': 'p', 'AttributeType': 'S' }]
+        ) as table:
+            table.meta.client.update_time_to_live(TableName=table.name,
+                TimeToLiveSpecification={'AttributeName': 'expiration', 'Enabled': True})
+            ks = 'alternator_' + table.name
+            with pytest.raises(CqlConfigurationException, match='not compatible'):
+                cql.execute(f"ALTER TABLE \"{ks}\".\"{table.name}\" WITH "
+                            f"compaction = {{'class': 'TimeWindowCompactionStrategy'}}")
