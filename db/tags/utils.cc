@@ -47,7 +47,7 @@ std::optional<std::string> find_tag(const schema& s, const sstring& tag) {
 }
 
 future<> modify_tags(service::migration_manager& mm, sstring ks, sstring cf,
-                     std::function<void(std::map<sstring, sstring>&)> modify) {
+                     std::function<void(std::map<sstring, sstring>&, const schema&)> modify) {
     co_await mm.container().invoke_on(0, [ks = std::move(ks), cf = std::move(cf), modify = std::move(modify)] (service::migration_manager& mm) -> future<> {
         size_t retries = mm.get_concurrent_ddl_retries();
         for (;;) {
@@ -64,7 +64,7 @@ future<> modify_tags(service::migration_manager& mm, sstring ks, sstring cf,
                 // to modify the tags, we must make a copy.
                 tags = *tags_ptr;
             }
-            modify(tags);
+            modify(tags, *s);
             schema_builder builder(s);
             builder.add_extension(tags_extension::NAME, ::make_shared<tags_extension>(tags));
 

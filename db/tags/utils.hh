@@ -44,6 +44,8 @@ std::optional<std::string> find_tag(const schema& s, const sstring& tag);
 //
 // If the table didn't have the tags schema extension, it's fine: The function
 // is passed an empty map, and the tags it adds will be added to the table.
+// The function also receives the table's up-to-date schema, re-read under
+// the group0 guard, so callers can safely inspect current table properties.
 future<> modify_tags(service::migration_manager& mm, sstring ks, sstring cf,
-                     std::function<void(std::map<sstring, sstring>&)> modify_func);
+                     std::function<void(std::map<sstring, sstring>&, const schema&)> modify_func);
 }

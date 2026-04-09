@@ -1498,7 +1498,7 @@ future<executor::request_return_type> executor::tag_resource(client_state& clien
         co_return api_error::validation("The number of tags must be at least 1") ;
     }
     co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, schema, auth::permission::ALTER, _stats);
-    co_await db::modify_tags(_mm, schema->ks_name(), schema->cf_name(), [tags](std::map<sstring, sstring>& tags_map) {
+    co_await db::modify_tags(_mm, schema->ks_name(), schema->cf_name(), [tags](std::map<sstring, sstring>& tags_map, const ::schema&) {
         update_tags_map(*tags, tags_map, update_tags_action::add_tags);
     });
     co_return ""; // empty response
@@ -1519,7 +1519,7 @@ future<executor::request_return_type> executor::untag_resource(client_state& cli
     schema_ptr schema = get_table_from_arn(_proxy, rjson::to_string_view(*arn));
     get_stats_from_schema(_proxy, *schema)->api_operations.untag_resource++;
     co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, schema, auth::permission::ALTER, _stats);
-    co_await db::modify_tags(_mm, schema->ks_name(), schema->cf_name(), [tags](std::map<sstring, sstring>& tags_map) {
+    co_await db::modify_tags(_mm, schema->ks_name(), schema->cf_name(), [tags](std::map<sstring, sstring>& tags_map, const ::schema&) {
         update_tags_map(*tags, tags_map, update_tags_action::delete_tags);
     });
     co_return ""; // empty response

@@ -88,8 +88,14 @@ future<executor::request_return_type> executor::update_time_to_live(client_state
     sstring attribute_name = rjson::to_sstring(*v);
 
     co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, schema, auth::permission::ALTER, _stats);
-    co_await db::modify_tags(_mm, schema->ks_name(), schema->cf_name(), [&](std::map<sstring, sstring>& tags_map) {
+    co_await db::modify_tags(_mm, schema->ks_name(), schema->cf_name(), [&](std::map<sstring, sstring>& tags_map, const ::schema& s) {
         if (enabled) {
+            // Check against the up-to-date schema read under the group0
+            // guard, not the potentially stale `schema` captured above.
+            if (s.compaction_strategy() == compaction::compaction_strategy_type::time_window) {
+                throw api_error::validation(
+                    "Per-row TTL is not compatible with TimeWindowCompactionStrategy");
+            }
             if (tags_map.contains(TTL_TAG_KEY)) {
                 throw api_error::validation("TTL is already enabled");
             }
