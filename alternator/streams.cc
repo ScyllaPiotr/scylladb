@@ -1122,6 +1122,7 @@ bool executor::add_stream_options(const rjson::value& stream_specification, sche
 
         cdc::options opts;
         opts.enabled(true);
+        // cdc::delta_mode is ignored by Alternator, so aim for the least overhead.
         opts.set_delta_mode(cdc::delta_mode::keys);
         opts.ttl(std::chrono::duration_cast<std::chrono::seconds>(dynamodb_streams_max_window).count());
 
