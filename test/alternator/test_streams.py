@@ -47,8 +47,8 @@ def disable_stream(dynamodbstreams, table):
     # Wait for the stream to really be disabled. A table may have multiple
     # historic streams - we need all of them to become DISABLED. One of
     # them (the current one) may remain DISABLING for some time.
-    exp = time.process_time() + 60
-    while time.process_time() < exp:
+    exp = time.time() + 60
+    while time.time() < exp:
         streams = dynamodbstreams.list_streams(TableName=table.name)
         disabled = True
         for stream in streams['Streams']:
@@ -104,8 +104,8 @@ def create_stream_test_table(dynamodb, StreamViewType=None, Tags=None):
                 raise
 
 def wait_for_active_stream(dynamodbstreams, table, timeout=60):
-    exp = time.process_time() + timeout
-    while time.process_time() < exp:
+    exp = time.time() + timeout
+    while time.time() < exp:
         streams = dynamodbstreams.list_streams(TableName=table.name)
         for stream in streams['Streams']:
             arn = stream['StreamArn']
