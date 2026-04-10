@@ -28,6 +28,7 @@
 #include "service/storage_proxy.hh"
 #include "gms/feature.hh"
 #include "gms/feature_service.hh"
+#include "replica/database.hh"
 
 #include "executor.hh"
 #include "data_dictionary/data_dictionary.hh"
