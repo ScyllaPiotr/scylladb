@@ -280,7 +280,10 @@ future<alternator::executor::request_return_type> alternator::executor::list_str
         if (!is_alternator_keyspace(ks_name)) {
             continue;
         }
-        if (cdc::is_log_for_some_table(db.real_database(), ks_name, cf_name)) {
+        // Use get_base_table instead of is_log_for_some_table because the
+        // latter requires CDC to be enabled, but we want to list streams
+        // that have been disabled but whose log table still exists (#7239).
+        if (cdc::get_base_table(db.real_database(), ks_name, cf_name)) {
             rjson::value new_entry = rjson::empty_object();
             last = i->schema()->id();
             auto arn = stream_arn{ i->schema(), cdc::get_base_table(db.real_database(), *i->schema()) };
@@ -424,7 +427,7 @@ std::istream& operator>>(std::istream& is, stream_view_type& type) {
     return is;
 }
 
-static stream_view_type cdc_options_to_steam_view_type(const cdc::options& opts) {
+static stream_view_type cdc_options_to_stream_view_type(const cdc::options& opts) {
     stream_view_type type = stream_view_type::KEYS_ONLY;
     if (opts.preimage() && opts.postimage()) {
         type = stream_view_type::NEW_AND_OLD_IMAGES;
@@ -870,6 +873,7 @@ future<executor::request_return_type> executor::describe_stream(client_state& cl
     auto& opts = bs->cdc_options();
 
     auto status = "DISABLED";
+    bool stream_disabled = !opts.enabled();
 
     if (opts.enabled()) {
         if (!_cdc_metadata.streams_available()) {
@@ -885,7 +889,7 @@ future<executor::request_return_type> executor::describe_stream(client_state& cl
 
     rjson::add(stream_desc, "StreamStatus", rjson::from_string(status));
 
-    stream_view_type type = cdc_options_to_steam_view_type(opts);
+    stream_view_type type = cdc_options_to_stream_view_type(opts);
 
     rjson::add(stream_desc, "StreamArn", stream_arn);
     rjson::add(stream_desc, "StreamViewType", type);
@@ -893,10 +897,9 @@ future<executor::request_return_type> executor::describe_stream(client_state& cl
 
     describe_key_schema(stream_desc, *bs);
 
-    if (!opts.enabled()) {
-        rjson::add(ret, "StreamDescription", std::move(stream_desc));
-        co_return rjson::print(std::move(ret));
-    }
+    // For disabled streams, we still fall through to enumerate shards
+    // below. All shards will have EndingSequenceNumber set, indicating
+    // they are closed. See issue #7239.
 
     // TODO: label
     // TODO: creation time
@@ -979,6 +982,12 @@ future<executor::request_return_type> executor::describe_stream(client_state& cl
         auto expired = [&]() -> std::optional<db_clock::time_point> {
             auto j = std::next(i);
             if (j == e) {
+                // For a disabled stream, all shards are closed (#7239).
+                // Use "now" as the ending sequence number for the last
+                // generation's shards.
+                if (stream_disabled) {
+                    return db_clock::now();
+                }
                 return std::nullopt;
             }
             // add this so we sort of match potential 
@@ -1329,7 +1338,7 @@ future<executor::request_return_type> executor::get_records(client_state& client
         | std::ranges::to<query::column_id_vector>()
     ;
 
-    stream_view_type type = cdc_options_to_steam_view_type(base->cdc_options());
+    stream_view_type type = cdc_options_to_stream_view_type(base->cdc_options());
 
     auto selection = cql3::selection::selection::for_columns(schema, std::move(columns));
     auto partition_slice = query::partition_slice(
@@ -1513,7 +1522,10 @@ future<executor::request_return_type> executor::get_records(client_state& client
 
     auto& shard = iter.shard;
 
-    if (shard.time < ts && ts < high_ts) {
+    if (!base->cdc_options().enabled()) {
+        // Stream is disabled -- all shards are closed (#7239).
+        // Don't return NextShardIterator.
+    } else if (shard.time < ts && ts < high_ts) {
         // The DynamoDB documentation states that when a shard is
         // closed, reading it until the end has NextShardIterator
         // "set to null". Our test test_streams_closed_read
@@ -1533,7 +1545,7 @@ future<executor::request_return_type> executor::get_records(client_state& client
     co_return rjson::print(std::move(ret));
 }
 
-bool executor::add_stream_options(const rjson::value& stream_specification, schema_builder& builder, service::storage_proxy& sp) {
+bool executor::add_stream_options(const rjson::value& stream_specification, schema_builder& builder, service::storage_proxy& sp, const cdc::options& existing_cdc_opts) {
     auto stream_enabled = rjson::find(stream_specification, "StreamEnabled");
     if (!stream_enabled || !stream_enabled->IsBool()) {
         throw api_error::validation("StreamSpecification needs boolean StreamEnabled");
@@ -1569,7 +1581,11 @@ bool executor::add_stream_options(const rjson::value& stream_specification, sche
         builder.with_cdc_options(opts);
         return true;
     } else {
-        cdc::options opts;
+        // When disabling, preserve the existing CDC options (preimage,
+        // postimage, ttl, etc.) so that DescribeStream can still report the
+        // correct StreamViewType on a disabled stream. Only flip enabled to
+        // false. See issue #7239.
+        cdc::options opts = existing_cdc_opts;
         opts.enabled(false);
         builder.with_cdc_options(opts);
         return false;
@@ -1578,33 +1594,42 @@ bool executor::add_stream_options(const rjson::value& stream_specification, sche
 
 void executor::supplement_table_stream_info(rjson::value& descr, const schema& schema, const service::storage_proxy& sp) {
     auto& opts = schema.cdc_options();
-    if (opts.enabled()) {
-        auto db = sp.data_dictionary();
-        auto cf = db.find_table(schema.ks_name(), cdc::log_name(schema.cf_name()));
-        stream_arn arn(cf.schema(), cdc::get_base_table(db.real_database(), *cf.schema()));
-        rjson::add(descr, "LatestStreamArn", arn);
-        rjson::add(descr, "LatestStreamLabel", rjson::from_string(stream_label(*cf.schema())));
-    } else if (!opts.enable_requested()) {
-        return;
+    // Show stream info when CDC is enabled, or when it was disabled but the
+    // log table still exists (the stream is usable for reads). See #7239.
+    auto db = sp.data_dictionary();
+    auto log_name = cdc::log_name(schema.cf_name());
+    bool has_log = false;
+    schema_ptr log_schema;
+    try {
+        auto cf = db.find_table(schema.ks_name(), log_name);
+        log_schema = cf.schema();
+        has_log = true;
+    } catch (data_dictionary::no_such_column_family&) {
     }
-    // For both enabled() and enable_requested():
-    // DynamoDB returns StreamEnabled=true in StreamSpecification even when
-    // the stream status is ENABLING (not yet fully active). We mirror this
-    // behavior: enable_requested means the user asked for streams but CDC
-    // is not yet finalized, so we still report StreamEnabled=true.
-    auto stream_desc = rjson::empty_object();
-    rjson::add(stream_desc, "StreamEnabled", true);
 
-    auto mode = stream_view_type::KEYS_ONLY;
-    if (opts.preimage() && opts.postimage()) {
-        mode = stream_view_type::NEW_AND_OLD_IMAGES;
-    } else if (opts.preimage()) {
-        mode = stream_view_type::OLD_IMAGE;
-    } else if (opts.postimage()) {
-        mode = stream_view_type::NEW_IMAGE;
+    if (has_log) {
+        stream_arn arn(log_schema, cdc::get_base_table(db.real_database(), *log_schema));
+        rjson::add(descr, "LatestStreamArn", arn);
+        rjson::add(descr, "LatestStreamLabel", rjson::from_string(stream_label(*log_schema)));
+
+        auto stream_desc = rjson::empty_object();
+        rjson::add(stream_desc, "StreamEnabled", opts.enabled());
+
+        stream_view_type mode = cdc_options_to_stream_view_type(opts);
+        rjson::add(stream_desc, "StreamViewType", mode);
+        rjson::add(descr, "StreamSpecification", std::move(stream_desc));
+    } else if (opts.enable_requested()) {
+        // DynamoDB returns StreamEnabled=true in StreamSpecification even when
+        // the stream status is ENABLING (not yet fully active). We mirror this
+        // behavior: enable_requested means the user asked for streams but CDC
+        // is not yet finalized, so we still report StreamEnabled=true.
+        auto stream_desc = rjson::empty_object();
+        rjson::add(stream_desc, "StreamEnabled", true);
+
+        stream_view_type mode = cdc_options_to_stream_view_type(opts);
+        rjson::add(stream_desc, "StreamViewType", mode);
+        rjson::add(descr, "StreamSpecification", std::move(stream_desc));
     }
-    rjson::add(stream_desc, "StreamViewType", mode);
-    rjson::add(descr, "StreamSpecification", std::move(stream_desc));
 }
 
 } // namespace alternator

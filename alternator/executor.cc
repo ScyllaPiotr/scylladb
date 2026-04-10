@@ -1860,7 +1860,7 @@ future<executor::request_return_type> executor::update_table(client_state& clien
             rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
             if (stream_specification && stream_specification->IsObject()) {
                 empty_request = false;
-                if (add_stream_options(*stream_specification, builder, p.local())) {
+                if (add_stream_options(*stream_specification, builder, p.local(), tab->cdc_options())) {
                     validate_cdc_log_name_length(builder.cf_name());
                     // On tablet tables, defer stream enablement and block
                     // tablet merges (see defer_enabling_streams_block_tablet_merges).
@@ -1874,6 +1874,26 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                     if (stream_enabled->GetBool()) {
                         if (tab->cdc_options().enabled() || tab->cdc_options().enable_requested()) {
                             co_return api_error::validation("Table already has an enabled stream: TableName: " + tab->cf_name());
+                        }
+                        // When re-enabling streams on an Alternator table, drop the old
+                        // CDC log table first as a separate schema change, so the
+                        // subsequent UpdateTable creates a fresh one with a new UUID
+                        // (= new StreamArn). See #7239.
+                        auto logname = cdc::log_name(tab->cf_name());
+                        auto& local_db = p.local().local_db();
+                        if (local_db.has_schema(tab->ks_name(), logname)
+                                && cdc::is_log_schema(*local_db.find_schema(tab->ks_name(), logname))) {
+                            auto drop_m = co_await service::prepare_column_family_drop_announcement(
+                                p.local(), tab->ks_name(), logname,
+                                group0_guard.write_timestamp());
+                            co_await mm.announce(std::move(drop_m), std::move(group0_guard),
+                                format("alternator-executor: drop old CDC log for {}", tab->cf_name()));
+                            co_await mm.wait_for_schema_agreement(
+                                p.local().local_db(), db::timeout_clock::now() + 10s, nullptr);
+                            group0_guard = co_await mm.start_group0_operation();
+                            tab = get_table(p.local(), request);
+                            builder = schema_builder(tab);
+                            add_stream_options(*stream_specification, builder, p.local(), tab->cdc_options());
                         }
                     }
                     else if (!tab->cdc_options().enabled() && !tab->cdc_options().enable_requested()) {

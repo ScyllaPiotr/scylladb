@@ -30,6 +30,7 @@
 #include "utils/updateable_value.hh"
 
 #include "tracing/trace_state.hh"
+#include "cdc/cdc_options.hh"
 
 
 namespace db {
@@ -199,7 +200,7 @@ private:
         tracing::trace_state_ptr trace_state, service_permit permit);
 
 public:
-    static bool add_stream_options(const rjson::value& stream_spec, schema_builder&, service::storage_proxy& sp);
+    static bool add_stream_options(const rjson::value& stream_spec, schema_builder&, service::storage_proxy& sp, const cdc::options& existing_cdc_opts = {});
     static void supplement_table_info(rjson::value& descr, const schema& schema, service::storage_proxy& sp);
     static void supplement_table_stream_info(rjson::value& descr, const schema& schema, const service::storage_proxy& sp);
 };
