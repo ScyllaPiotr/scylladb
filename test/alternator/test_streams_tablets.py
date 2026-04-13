@@ -9,8 +9,7 @@ import time, random, collections
 import pytest
 from test.alternator.test_streams import create_stream_test_table, wait_for_active_stream
 
-# we only care about tablets in this file
-TAGS = [{'Key': 'system:initial_tablets', 'Value': '0'}]
+TABLET_TAGS = [{'Key': 'system:initial_tablets', 'Value': '0'}]
 
 # get table_id from keyspace and table name
 def get_table_or_view_id(cql, keyspace: str, table: str):
@@ -101,7 +100,7 @@ def iterate_over_describe_stream(dynamodbstreams, arn, end_ts, filter_shard_id=N
 #  - build parent map (shard -> parent) and children map (shard -> list of children) between stream shards
 #  - call the callback with the data
 def run_parent_children_relationship_test(dynamodb, dynamodbstreams, rest_api, cql, tablet_multipliers, callback):
-    with create_stream_test_table(dynamodb, StreamViewType='NEW_AND_OLD_IMAGES') as table:
+    with create_stream_test_table(dynamodb, StreamViewType='NEW_AND_OLD_IMAGES', Tags=TABLET_TAGS) as table:
         (arn, label) = wait_for_active_stream(dynamodbstreams, table)
 
         ks = f'alternator_{table.name}'
@@ -383,7 +382,7 @@ def test_get_records_with_alternating_tablets_count(dynamodb, dynamodbstreams, r
     writes_per_tablet_multiplier = 100
     partition_count = 32
 
-    with create_stream_test_table(dynamodb, StreamViewType='NEW_AND_OLD_IMAGES') as table:
+    with create_stream_test_table(dynamodb, StreamViewType='NEW_AND_OLD_IMAGES', Tags=TABLET_TAGS) as table:
         (arn, label) = wait_for_active_stream(dynamodbstreams, table)
 
         ks = f'alternator_{table.name}'
