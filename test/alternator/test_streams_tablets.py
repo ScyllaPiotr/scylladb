@@ -111,19 +111,35 @@ def run_parent_children_relationship_test(dynamodb, dynamodbstreams, rest_api, c
         init_table_count = get_tablet_count_for_base_table_of_table(rest_api, cql, ks, cdc_log_table_name)
 
         # Drive tablet count changes according to tablet_multipliers.
-        # Each change triggers a new "generation" of stream shards to be created,
-        # so the total number of stream shards across all generations is
-        # sum(tablet_multipliers) * init_table_count.
-        # tablet multilplier might be less than 1
+        # Each change triggers a new "generation" of stream shards to be created.
+        # tablet multiplier might be less than 1
         for tablet_mult in tablet_multipliers:
             tablet_count = int(init_table_count * tablet_mult)
             assert tablet_count >= 1
             set_tablet_count_and_wait(rest_api, cql, ks, table_name, cdc_log_table_name, tablet_count)
 
+        # Strip multipliers that don't change the tablet count from the
+        # previous state. The table starts with a multiplier of 1 (i.e.
+        # init_table_count tablets), so a leading 1 is a no-op. Subsequent
+        # duplicates are also no-ops since ALTER TABLE with the current
+        # tablet count doesn't trigger a new CDC stream generation.
+        effective_multipliers = []
+        for m in tablet_multipliers:
+            if effective_multipliers:
+                if m != effective_multipliers[-1]:
+                    effective_multipliers.append(m)
+            elif m != 1:
+                effective_multipliers.append(m)
+
+        # The total number of stream shards across all generations:
+        # 1) The root generation created when the table is first created.
+        total_shard_count = init_table_count
+        # 2) One generation per effective multiplier.
+        total_shard_count += int(sum(effective_multipliers) * init_table_count)
+
         # Poll DescribeStream until all expected stream shards have appeared,
         # building a shard_id -> parent_shard_id map (shard_parents_map) and
         # collecting root shard IDs (shards with no parent).
-        total_shard_count = sum(tablet_multipliers) * init_table_count
         end_ts = time.time() + 30
         root_shard_ids = []
         shard_parents_map = {}
