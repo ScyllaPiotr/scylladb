@@ -30,6 +30,7 @@ from cassandra import AlreadyExists, AuthenticationFailed, ConsistencyLevel, Inv
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.cluster import NoHostAvailable, Session, EXEC_PROFILE_DEFAULT
 from cassandra.query import SimpleStatement, named_tuple_factory
+from cassandra.util import uuid_from_time
 
 from test.cluster.dtest.dtest_class import create_ks, wait_for
 from test.cluster.dtest.tools.assertions import assert_invalid
@@ -556,13 +557,22 @@ class CQLAuditTester(AuditTester):
 
         return deduplicated_entries_dict
 
-    def get_audit_log_dict(self, session):
+    def get_audit_log_dict(self, session, confidence_window_s: int = 0):
         """Returns a dictionary mapping audit mode name to a sorted list of audit log.
 
         The logs are sorted by the event times (time-uuid) with the node as tie breaker.
         """
         consistency_level = ConsistencyLevel.QUORUM if len(self.server_addresses) > 1 else ConsistencyLevel.ONE
         log_dict = self.helper.get_audit_log_dict(session, consistency_level)
+        # Intentionally keep the 0s case unfiltered. Even a 0s cutoff would
+        # still compare server-generated UUID timestamps against the local test
+        # runner clock and could hide rows if the clocks differ slightly.
+        if confidence_window_s > 0:
+            stable_before = uuid_from_time(time.time() - confidence_window_s).time
+            filtered_dict = dict[str, list[AuditEntry]]()
+            for mode, rows in log_dict.items():
+                filtered_dict[mode] = [row for row in rows if row.event_time.time <= stable_before]
+            log_dict = filtered_dict
         logger.debug(f"get_audit_log_dict: {log_dict}")
         return log_dict
 
@@ -751,10 +761,10 @@ class CQLAuditTester(AuditTester):
         return rows_dict
 
     @contextmanager
-    def assert_entries_were_added(self, session: Session, expected_entries: list[AuditEntry], merge_duplicate_rows: bool = True, filter_out_cassandra_auth: bool = False):
+    def assert_entries_were_added(self, session: Session, expected_entries: list[AuditEntry], merge_duplicate_rows: bool = True, filter_out_cassandra_auth: bool = False, confidence_window_s: int = 0):
         # Get audit entries before executing the query, to later compare with
         # audit entries after executing the query.
-        rows_before_dict = self.get_audit_log_dict(session)
+        rows_before_dict = self.get_audit_log_dict(session, confidence_window_s=confidence_window_s)
         for mode, rows_before in rows_before_dict.items():
             set_of_rows_before = set(rows_before)
             assert len(set_of_rows_before) == len(rows_before), f"audit {mode} contains duplicate rows: {rows_before}"
@@ -762,7 +772,7 @@ class CQLAuditTester(AuditTester):
 
         new_rows_dict = dict[str, list[AuditEntry]]()
         def is_number_of_new_rows_correct():
-            rows_after_dict = self.get_audit_log_dict(session)
+            rows_after_dict = self.get_audit_log_dict(session, confidence_window_s=confidence_window_s)
             for mode, rows_after in rows_after_dict.items():
                 assert len(set(rows_after)) == len(rows_after), f"audit {mode} contains duplicate rows: {rows_after}"
 
@@ -1199,7 +1209,7 @@ class CQLAuditTester(AuditTester):
 
         session.execute("DROP ROLE IF EXISTS test_role")
 
-    async def test_negative_audit_records_ddl(self):
+    async def test_negative_audit_records_ddl(self, confidence_window_s: int = 0):
         """
         Test that failed DDL statements are audited.
         """
@@ -1209,7 +1219,7 @@ class CQLAuditTester(AuditTester):
 
         expected_entry = AuditEntry(category="DDL", table="", ks="ks", user="cassandra", cl="ONE", error=True, statement=stmt)
 
-        with self.assert_entries_were_added(session, [expected_entry]):
+        with self.assert_entries_were_added(session, [expected_entry], confidence_window_s=confidence_window_s):
             assert_invalid(session, stmt, expected=AlreadyExists)
 
     async def test_negative_audit_records_dml(self):
@@ -1856,7 +1866,10 @@ async def test_audit_table_auth(manager: ManagerClient):
 async def test_audit_table_auth_multinode(manager: ManagerClient):
     """Table backend, auth enabled, multi-node (rf=3)."""
     t = CQLAuditTester(manager)
-    await t.test_negative_audit_records_ddl()
+    # Table-backed audit reads can briefly miss older rows and then observe
+    # them on a later poll. Hold back the freshest rows so this test compares
+    # a more stable view while keeping its strict ordering assertions.
+    await t.test_negative_audit_records_ddl(confidence_window_s=10)
 
 
 # AuditBackendTable, standalone / special config
