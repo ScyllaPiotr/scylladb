@@ -1190,6 +1190,12 @@ static bool generate_delta_values(const schema& s) {
  *
  * Additionally updates state required to produce pre/post-image if configured to do so (`enable_updating_state`).
  */
+
+// Alternator stores all non-key attributes in a single map column named ":attrs".
+// This name is defined in alternator/executor.hh as executor::ATTRS_COLUMN_NAME,
+// but we avoid that include here to keep CDC independent of Alternator headers.
+static constexpr auto alternator_attrs_column_name = ":attrs";
+
 struct process_row_visitor {
     const clustering_key& _log_ck;
 
@@ -1218,7 +1224,11 @@ struct process_row_visitor {
 
     const bool _generate_delta_values = true; 
     
-    // true if we are processing changes that were produced by Alternator
+    // True if we are generating CDC mutations for a change in an Alternator table.
+    // Note: the noop detection logic that uses this flag only takes effect when
+    // _enable_updating_state is true, which requires alternator_streams_increased_compatibility
+    // to be enabled. When that flag is off, _alternator is still set but has no behavioral
+    // effect on CDC output - noop rows will NOT be filtered.
     const bool _alternator;
 
     // will be set to true, if any kind of change in row will be detected. Used only, when processing Alternator's changes.
@@ -1252,6 +1262,11 @@ struct process_row_visitor {
         // we also need cdc to build post image for us
         // we add check for `_alternator` here for performance reasons - no point in byte compare objects
         // if the return value will be ignored
+        // We compare only cell values, not CQL timestamps or TTLs. Alternator
+        // operations use uniform per-cell timestamps and don't set per-cell TTLs,
+        // so value equality is sufficient to detect noops. If Alternator ever
+        // gains support for user-controlled timestamps (see #28806) or per-cell
+        // TTLs, this comparison should be extended to include the full cell.
         if (_alternator && _enable_updating_state) {
             _alternator_any_value_changed = _alternator_any_value_changed || it->second != value;
         }
@@ -1405,7 +1420,12 @@ struct process_row_visitor {
         auto&& deleted_keys = std::get<1>(result);
         auto&& added_cells = std::get<2>(result);
 
-        _alternator_only_deletes = cdef.name_as_text() == ":attrs" && !deleted_keys.empty() && !added_cells.has_value();
+        // Track whether this collection mutation only deletes elements from :attrs
+        // without adding any. This is needed in clustered_row_cells() to detect a
+        // specific noop case: a REMOVE operation on a non-existent item (row_state
+        // is null) that only tries to delete attributes. In that case the entire
+        // row should be excluded from the CDC log.
+        _alternator_only_deletes = cdef.name_as_text() == alternator_attrs_column_name && !deleted_keys.empty() && !added_cells.has_value();
 
         // FIXME: we're doing redundant work: first we serialize the set of deleted keys into a blob,
         // then we deserialize again when merging images below
@@ -1465,16 +1485,24 @@ struct process_change_visitor {
 
     row_states_map& _clustering_row_states;
 
-    // clustering keys' as bytes of rows that should be ignored, when writing cdc log changes
-    // filtering will be done in `clean_up_noop_rows` function. Used only, when processing Alternator's changes.
-    // Since Alternator clustering key is always at most single column, we store unpacked clustering key.
-    // If Alternator table is without clustering key, that means partition has at most one row, any value present
-    // in _alternator_clustering_keys_to_ignore will make us ignore that single row -
-    // we will use an empty bytes object.
+    // Clustering keys (as bytes) of rows that should be ignored when writing
+    // CDC log changes. Filtering is done in clean_up_noop_rows(). Used only
+    // when processing Alternator's changes.
+    // Since Alternator clustering key is always at most single column, we store
+    // unpacked clustering key. If Alternator table is without clustering key,
+    // that means partition has at most one row, any value present in
+    // _alternator_clustering_keys_to_ignore will make us ignore that single
+    // row - we will use an empty bytes object.
+    // Noop row filtering is only active when _enable_updating_state is true,
+    // which requires alternator_streams_increased_compatibility. Rows are added
+    // to this set during mutation processing (phase 2) and filtered out in
+    // clean_up_noop_rows() at the end of each record.
     std::unordered_set<bytes>& _alternator_clustering_keys_to_ignore;
 
     cell_map& _static_row_state;
 
+    // Set via aggregate initialization; const to match the pattern of _is_update and
+    // _generate_delta_values which are also immutable after construction.
     const bool _alternator_schema_has_no_clustering_key = false;
 
     const bool _is_update = false;
@@ -1803,6 +1831,12 @@ public:
         // alternator_streams_increased_compatibility set to true reads preimage, but we need to set
         // _enable_updating_state to true to keep track of changes and produce correct pre/post images even
         // if upper layer didn't request them explicitly.
+        // In the previous implementation (the should_skip logic in split.cc), row state tracking
+        // was populated by the preimage query results, independently of _enable_updating_state.
+        // The new per-row noop detection relies on _clustering_row_states being maintained
+        // during mutation processing, which only happens when _enable_updating_state is true.
+        // Therefore we must enable it when alternator_streams_increased_compatibility is active,
+        // even if the user didn't explicitly request pre/post images.
         _enable_updating_state = _schema->cdc_options().postimage() || (!is_last && _schema->cdc_options().preimage()) || (_options.alternator && _options.alternator_streams_increased_compatibility);
     }
 

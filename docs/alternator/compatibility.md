@@ -325,6 +325,13 @@ experimental:
     in July 2025 to optimize shard discovery, is not yet implemented in
     Alternator.
     <https://github.com/scylladb/scylla/issues/25160>
+  * With the ``alternator_streams_increased_compatibility`` configuration
+    option enabled, operations that do not change the database state
+    (e.g., deleting a non-existent item, removing a non-existent
+    attribute, or re-inserting an identical item) will not produce
+    stream events. Without this option, such no-op operations may still
+    generate spurious stream events.
+    <https://github.com/scylladb/scylladb/issues/28368>
 
 ## Unimplemented API features
 

@@ -294,7 +294,6 @@ def test_describe_stream_with_nonexistent_last_shard(dynamodb, dynamodbstreams):
 # Test requires write_isolation set to always, otherwise upper layer will
 # split batch write into separate cdc operations, sidestepping the issue.
 # Reproduces SCYLLADB-1528.
-@pytest.mark.xfail(reason="will be fixed by subsequent commit")
 def test_streams_batch_write_mixing_noop_with_real_changes(test_table_ss_new_and_old_images_write_isolation_always, dynamodb, dynamodbstreams):
     def do_updates(table, p, c):
         events = []
@@ -320,7 +319,6 @@ def test_streams_batch_write_mixing_noop_with_real_changes(test_table_ss_new_and
 # Note: using NEW_AND_OLD_IMAGES view type also verifies that noop filtering
 # works correctly when post-images are enabled.
 # Reproduces #28368.
-@pytest.mark.xfail(reason="will be fixed by subsequent commit")
 def test_streams_noop_update_expr_on_missing_item(test_table_ss_new_and_old_images, dynamodb, dynamodbstreams):
     def do_updates(table, p, c):
         events = []
@@ -354,7 +352,6 @@ def test_streams_noop_update_expr_on_missing_item(test_table_ss_new_and_old_imag
 # without clustering key.
 # Test requires `alternator_streams_increased_compatibility` set to true.
 # Reproduces #28368.
-@pytest.mark.xfail(reason="will be fixed by subsequent commit")
 def test_streams_noop_update_expr_on_missing_item_on_no_clustering_key_table(test_table_s_no_ck_new_and_old_images, dynamodb, dynamodbstreams):
     def do_updates(table, p, c):
         events = []
@@ -388,7 +385,6 @@ def test_streams_noop_update_expr_on_missing_item_on_no_clustering_key_table(tes
 # no event (it's a noop since nothing changed).
 # Test requires `alternator_streams_increased_compatibility` set to true.
 # Reproduces #28368.
-@pytest.mark.xfail(reason="will be fixed by subsequent commit")
 def test_streams_noop_key_only_insert_and_reinsert(test_table_ss_new_and_old_images, dynamodb, dynamodbstreams):
     def do_updates(table, p, c):
         events = []
