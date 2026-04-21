@@ -1587,6 +1587,8 @@ bool executor::add_stream_options(const rjson::value& stream_specification, sche
         // false. See issue #7239.
         cdc::options opts = existing_cdc_opts;
         opts.enabled(false);
+        opts.enable_requested(false);
+        opts.tablet_merge_blocked(false);
         builder.with_cdc_options(opts);
         return false;
     }
