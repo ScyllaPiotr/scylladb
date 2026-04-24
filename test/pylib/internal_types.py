@@ -37,6 +37,6 @@ class ServerInfo(NamedTuple):
 class ServerUpState(IntEnum):
     PROCESS_STARTED = auto()
     HOST_ID_QUERIED = auto()
-    CQL_CONNECTED = auto()
-    CQL_QUERIED = auto()
+    CQL_ALTERNATOR_CONNECTED = auto()
+    CQL_ALTERNATOR_QUERIED = auto()
     SERVING = auto()  # Scylla sent sd_notify("serving")

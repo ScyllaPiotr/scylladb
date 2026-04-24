@@ -389,7 +389,7 @@ class ManagerClient:
                            seeds: list[IPAddress] | None = None,
                            timeout: float | None = None,
                            connect_driver: bool = True,
-                           expected_server_up_state: ServerUpState = ServerUpState.CQL_QUERIED,
+                           expected_server_up_state: ServerUpState = ServerUpState.CQL_ALTERNATOR_QUERIED,
                            cmdline_options_override: list[str] | None = None,
                            append_env_override: dict[str, str] | None = None,
                            auth_provider: dict[str, str] | None = None) -> None:
@@ -540,7 +540,7 @@ class ManagerClient:
                          seeds: Optional[List[IPAddress]] = None,
                          timeout: Optional[float] = ScyllaServer.TOPOLOGY_TIMEOUT,
                          server_encryption: str = "none",
-                         expected_server_up_state: ServerUpState = ServerUpState.CQL_QUERIED,
+                         expected_server_up_state: ServerUpState = ServerUpState.CQL_ALTERNATOR_QUERIED,
                          connect_driver: bool = True) -> ServerInfo:
         """Add a new server"""
         if expected_error is not None:
